@@ -141,10 +141,10 @@ elixir = "1.20.0-otp-29"     # the orchestrator brain
 
 [plugins]
 # Canonical, local-first path (works identically in CI). See §6.4.
-pixi-env = "https://github.com/esteve/mise-env-pixi"      # activates the per-version pixi PROJECT (pixi.toml + pixi.lock)
-pixi     = "https://github.com/esteve/mise-backend-pixi"  # backend: `mise use pixi:<tool>[@ver]` for conda tools
-# (Installed under the name `pixi` to get `pixi:<tool>` syntax; the README documents
-#  the default name `vfox-pixi:`. Confirm the prefix in Phase 0.)
+pixi-env  = "https://github.com/esteve/mise-env-pixi"      # activates the per-version pixi PROJECT (pixi.toml + pixi.lock)
+vfox-pixi = "https://github.com/esteve/mise-backend-pixi"  # backend: `mise use vfox-pixi:<tool>[@ver]` for conda tools
+# (MUST be `vfox-pixi`, NOT `pixi`: installing as `pixi` conflicts with the pixi tool and
+#  breaks it — validated Phase 0; see docs/superpowers/validation-log.md.)
 ```
 
 **Local == CI parity:** GitHub Actions installs this exact `mise.toml` via
