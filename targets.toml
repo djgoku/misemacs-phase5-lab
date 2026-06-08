@@ -1,0 +1,6 @@
+# The OS × arch matrix. v1 = macos-arm64 only. Fail-closed: enabled must be explicit.
+[targets.macos-arm64]
+os = "macos"          # aqua {{.OS}} after darwin->macos replacement
+arch = "arm64"        # aqua {{.Arch}}
+runner = "macos-14"   # arm64 hosted runner
+enabled = true

@@ -1,0 +1,11 @@
+[targets.macos-arm64]
+os = "macos"
+arch = "arm64"
+runner = "macos-14"
+enabled = true
+
+[targets.linux-arm64]
+os = "linux"
+arch = "arm64"
+runner = "ubuntu-24.04-arm"
+enabled = false
