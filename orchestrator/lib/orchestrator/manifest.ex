@@ -53,4 +53,29 @@ defmodule Orchestrator.Manifest do
       {:ok, jobs(Map.get(vmap, "versions", %{}), Map.get(tmap, "targets", %{}))}
     end
   end
+
+  @version_input_files ~w(mise.toml pixi.toml pixi.lock)
+
+  @doc """
+  The per-version build-input files (relative to repo root) that MUST exist for a version.
+  These are exactly the bytes folded into the §8 fingerprint (`mise_toml`, `pixi_toml`,
+  `pixi_lock`). "Add a version = data": a new `versions.toml` row needs a `versions/<name>/`
+  dir holding these three files — no code change.
+  """
+  @spec version_input_files(String.t()) :: [String.t()]
+  def version_input_files(name) do
+    Enum.map(@version_input_files, &Path.join(["versions", name, &1]))
+  end
+
+  @doc """
+  Returns the version-input files MISSING under `repo_root` for the given version names
+  (empty list = all present). Fail-loud helper for the layout-contract test / future CLI.
+  """
+  @spec missing_version_files(Path.t(), [String.t()]) :: [String.t()]
+  def missing_version_files(repo_root, names) do
+    for name <- names,
+        rel <- version_input_files(name),
+        not File.exists?(Path.join(repo_root, rel)),
+        do: rel
+  end
 end
