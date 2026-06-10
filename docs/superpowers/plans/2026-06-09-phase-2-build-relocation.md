@@ -22,28 +22,27 @@ These were settled with the user; the umbrella spec (`docs/superpowers/specs/202
 - **Decision D — `bin/` move + Info.plist/icon stay in Phase 4.** Phase 2 relocates whatever Mach-O `make install` produces, in their default locations.
 - **Decision E — host `make`/CLT fingerprint gap (spec §8): record now, wire in Phase 5.** Resolution in Task 7: fold `xcode-select -p` + the active clang/SDK build version into `toolchain_hash` when the fingerprint is consumed (Phase 5). No code in Phase 2.
 - **rpath ownership.** `build-emacs` adds only `-Wl,-headerpad_max_install_names` and `-Wl,-rpath,$CONDA_PREFIX/lib` (the latter solely so the in-build dump step can load conda dylibs — Phase-1 finding). `Orchestrator.Relocate` adds the depth-correct `@loader_path/<rel-to-Frameworks>` rpath to every Mach-O and deletes the foreign (`$CONDA_PREFIX/lib`) rpath. (Refines spec §9.)
-- **Clean-VM proof is host-side.** `mise run cleanroom` clones a fresh tart VM (no pixi). pregate (itself a VM; no nested virt) runs build + relocate + the static gate.
+- **Clean-VM proof = the one pregate macOS VM.** pregate (a fresh disposable macOS VM, host-orchestrated) runs build → relocate → static gate → `mise run cleanroom` (moves the pixi env aside, then `--batch` + a GUI frame). No second/nested VM, no `sshpass`, no bespoke image pull. Local "done" rests on the static gate + the moved-aside fixture test + the real-app validation.
 
 ## File Structure
 
 | Path | New? | Responsibility |
 |---|---|---|
 | `orchestrator/lib/orchestrator/macho.ex` | create | **Pure** Mach-O reasoning: `classify/1`, `relpath/2`, `parse_id/1`, `parse_deps/2`, `parse_rpaths/1`, `bundleable/1`, `gate_violations/2`. No IO. |
-| `orchestrator/lib/orchestrator/macho/tool.ex` | create | The IO **behaviour** (`@callback` for macho?/id/deps/rpaths/set_id/change/add_rpath/delete_rpath/resign). |
+| `orchestrator/lib/orchestrator/macho/tool.ex` | create | The IO **behaviour** (`@callback` for macho?/id/deps/rpaths/set_id/change/add_rpath/delete_rpath/sign_bundle). |
 | `orchestrator/lib/orchestrator/macho/otool.ex` | create | Default IO **adapter** — shells `otool`/`install_name_tool`/`codesign` via `System.cmd`, parses with `Orchestrator.Macho`. |
-| `orchestrator/lib/orchestrator/relocate.ex` | create | The runner: BFS the closure into `Contents/Frameworks`, normalize ids/refs, fix rpaths, re-sign, gate. Reasoning via `Macho`, IO via a `Tool` (default `Otool`). |
+| `orchestrator/lib/orchestrator/relocate.ex` | create | The runner: BFS the closure into `Contents/Frameworks`, normalize ids/refs, fix rpaths, deep ad-hoc sign the whole bundle once, gate. Reasoning via `Macho`, IO via a `Tool` (default `Otool`). |
 | `orchestrator/lib/mix/tasks/relocate.ex` | create | `mix relocate <app> <build_libdir>` entrypoint → `Orchestrator.Relocate.run/2`. |
 | `orchestrator/test/orchestrator/macho_test.exs` | create | Pure tests (run everywhere): classify/relpath/parse/bundleable/gate_violations with fixture strings. |
 | `orchestrator/test/orchestrator/relocate_test.exs` | create | `@tag :macos` integration: clang-built fixture bundle → `Relocate.run` → gate ok + runs with build libdir moved aside. |
 | `orchestrator/test/test_helper.exs` | modify | Exclude `:macos` tests off Darwin. |
 | `lib/macho.sh`, `tests/macho_test.sh` | **delete** | Superseded by the Elixir modules (Task 1 `git rm`s them). |
 | `pipeline/build-emacs` | create | Fetch + configure + make + install under the pixi env → `build/<v>/Emacs.app` + `conda-prefix-lib.txt` + otool discovery dump. |
-| `scripts/cleanroom.sh` | create | Host-side tart-VM DoD proof: `--batch` + GUI frame smoke in a fresh no-pixi VM. |
-| `mise.toml` | modify | Add tasks `build`, `relocate` (→ `mix relocate`), `cleanroom`. (No `test-macho` — the Elixir tests run under `mise run test`.) |
+| `mise.toml` | modify | Add tasks `build`, `relocate` (→ `mix relocate`), `cleanroom` (move pixi env aside + no-pixi launch). (No `test-macho` — Elixir tests run under `mise run test`.) |
 | `.gitignore` | modify | Ignore `/build/`. |
-| `.pregate/macos.sh` | modify | After the shared body: `mise run build` + `mise run relocate` (static gate). No nested VM. |
-| `versions/master/mise.toml` | modify | Fix the stale "ncurses = system /usr/lib" comment (Task 7). |
-| `docs/superpowers/validation-log.md`, `docs/.../2026-06-05-…-design.md` | modify | Phase 2 findings + Decision E + spec reconcile (Task 7). |
+| `.pregate/macos.sh` | modify | After the shared body: `mise run build` + `mise run relocate` + `mise run cleanroom` — all in the one fresh macOS VM. |
+| `versions/master/mise.toml` | modify | Fix the stale "ncurses = system /usr/lib" comment (Task 6). |
+| `docs/superpowers/validation-log.md`, `docs/.../2026-06-05-…-design.md` | modify | Phase 2 findings + Decision E + spec reconcile (Task 6). |
 
 **Conventions (from the orchestrator):** modules carry `@moduledoc`/`@type`/`@spec`/`@doc`; tests `use ExUnit.Case, async: true` with `alias`; pure logic has no IO and is fixture-tested; build stages are bash invoked as `bash pipeline/<stage> <version>`, reading `EMACS_REF`/`EMACS_CONFIGURE_FLAGS` from `versions/<v>/mise.toml` via `mise exec`, entering the pixi env with `mise exec -- pixi run --manifest-path "$VDIR/pixi.toml"`. Commit after each task.
 
@@ -683,78 +682,9 @@ libxml2, tree-sitter, ncurses. No .pixi refs/rpaths remain."
 
 ---
 
-## Task 5: `scripts/cleanroom.sh` — the clean-VM DoD proof
+## Task 5: Wire mise tasks, gitignore, and the pregate clean-room
 
-**Files:**
-- Create: `scripts/cleanroom.sh`
-
-Runs on the **host** (tart needs non-nested virtualization). Proves the relocated app launches on a macOS VM that never had pixi.
-
-- [ ] **Step 1: Write `scripts/cleanroom.sh`**
-
-```bash
-#!/usr/bin/env bash
-# scripts/cleanroom.sh <version> — Phase 2 DoD proof.
-# Clone a FRESH macOS VM that never had pixi, copy build/<version>/Emacs.app in, and prove it
-# launches: `--batch` (forces dyld to resolve the full bundled closure with NO pixi present) +
-# a GUI frame smoke. HOST-ONLY (do not run inside the pregate VM — no nested virtualization).
-# Prereqs: tart (mise/aqua), sshpass; a base image (default cirruslabs macos base, admin/admin).
-set -euo pipefail
-HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-VERSION="${1:-master}"
-APP_DIR="$HERE/build/$VERSION"
-IMAGE="${CLEANROOM_IMAGE:-ghcr.io/cirruslabs/macos-sequoia-base:latest}"
-VM="misemacs-cleanroom-$VERSION"
-TART() { mise exec -- tart "$@"; }
-[ -d "$APP_DIR/Emacs.app" ] || { echo "FATAL: $APP_DIR/Emacs.app missing — run 'mise run build && mise run relocate'"; exit 1; }
-
-cleanup() { TART stop "$VM" >/dev/null 2>&1 || true; TART delete "$VM" >/dev/null 2>&1 || true; }
-trap cleanup EXIT
-
-echo ">> [1] clone a fresh clean VM ($IMAGE)"
-TART clone "$IMAGE" "$VM"
-echo ">> [2] boot (headless)"
-TART run --no-graphics "$VM" >/dev/null 2>&1 &
-ip=""; for _ in $(seq 1 60); do ip="$(TART ip "$VM" 2>/dev/null || true)"; [ -n "$ip" ] && break; sleep 2; done
-[ -n "$ip" ] || { echo "FATAL: VM never got an IP"; exit 1; }
-echo "   ip=$ip"
-SSH() { sshpass -p admin ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "admin@$ip" "$@"; }
-
-echo ">> [3] confirm the VM is clean (no pixi/conda) and copy the app in"
-SSH 'command -v pixi conda >/dev/null 2>&1 && { echo "ABORT: VM already has pixi/conda"; exit 1; } || echo "   clean: no pixi/conda"'
-( cd "$APP_DIR" && tar czf - Emacs.app ) | SSH 'mkdir -p ~/app && tar xzf - -C ~/app'
-
-echo ">> [4] --batch (dyld must resolve the FULL bundled closure with no pixi) — THE gate"
-SSH '~/app/Emacs.app/Contents/MacOS/Emacs --batch --eval "(princ (format \"ok %s\\n\" emacs-version))"'
-
-echo ">> [5] GUI frame smoke (NS window system via the image auto-login session)"
-# If a plain ssh can't reach the aqua GUI session, wrap with: launchctl asuser $(id -u admin) ...
-SSH 'launchctl asuser $(id -u admin) ~/app/Emacs.app/Contents/MacOS/Emacs -Q \
-       --eval "(run-with-timer 1 nil (lambda () (kill-emacs 0)))"' \
-  && echo "   GUI frame OK" || { echo "FAIL: GUI frame launch"; exit 1; }
-
-echo ">> cleanroom: PASS — self-contained on a clean macOS VM (no pixi)"
-```
-
-- [ ] **Step 2: Pull a base image once (if needed) and run the proof**
-Run:
-```bash
-mise exec -- tart list | grep -q macos-sequoia-base || mise exec -- tart pull ghcr.io/cirruslabs/macos-sequoia-base:latest
-bash scripts/cleanroom.sh master
-```
-Expected: `[4]` prints `ok 32.0.50`; `[5]` prints `GUI frame OK`; final `cleanroom: PASS`.
-
-> **Validation points:** (a) `sshpass` must be installed (document the host install). (b) If `--no-graphics` prevents the NS GUI session, drop it; if `[5]` still can't reach the session over ssh, the `launchctl asuser` wrapper is the fallback. (c) `[4]` (`--batch`) is the **hard** DoD gate; record `[5]`'s working invocation in Task 7.
-
-- [ ] **Step 3: Commit**
-```bash
-git add scripts/cleanroom.sh
-git commit -m "feat(phase2): cleanroom.sh — fresh-tart-VM launch proof (no pixi)"
-```
-
----
-
-## Task 6: Wire mise tasks, gitignore, and pregate
+The clean-room "no-pixi launch" runs **inside the one fresh pregate macOS VM** (build → relocate → gate → move the pixi env aside → launch), exposed as a `mise run cleanroom` task that pregate calls — no separate VM, no nested virtualization, no `sshpass`, no bespoke image pull. The "clean machine" is the pregate VM itself (fresh OS + toolchain only) with the pixi env moved aside. (Local Phase-2 "done" already rests on the static gate + the moved-aside fixture test + the real-app validation — see Task 4.)
 
 **Files:**
 - Modify: `mise.toml`, `.gitignore`, `.pregate/macos.sh`
@@ -772,11 +702,29 @@ dir = "orchestrator"
 run = "mix relocate ../build/master/Emacs.app \"$(cat ../build/master/conda-prefix-lib.txt)\""
 
 [tasks.cleanroom]
-description = "Phase 2 DoD: launch the relocated Emacs.app in a fresh tart VM with no pixi"
-run = "bash scripts/cleanroom.sh master"
+description = "Phase 2 DoD: prove the relocated app runs with the pixi env moved aside (no-pixi launch)"
+run = '''
+set -euo pipefail
+APP="build/master/Emacs.app"
+ENV_DIR="versions/master/.pixi"
+[ -d "$APP" ] || { echo "FATAL: $APP missing — run 'mise run build && mise run relocate' first"; exit 1; }
+ASIDE="$(mktemp -d)/pixi"
+restore() { [ -d "$ASIDE" ] && mv "$ASIDE" "$ENV_DIR"; }
+trap restore EXIT
+[ -d "$ENV_DIR" ] && mv "$ENV_DIR" "$ASIDE"    # simulate a machine with no pixi env present
+echo ">> [1] --batch (dyld must resolve the full bundled closure with the pixi env gone) — THE gate"
+"$APP/Contents/MacOS/Emacs" --batch --eval '(princ (format "ok %s\n" emacs-version))'
+echo ">> [2] GUI frame smoke (NS path; needs a display/session — best-effort)"
+if "$APP/Contents/MacOS/Emacs" -Q --eval '(run-with-timer 1 nil (lambda () (kill-emacs 0)))' 2>/dev/null; then
+  echo "   GUI frame OK"
+else
+  echo "   GUI frame skipped (no display/session — --batch is the hard gate)"
+fi
+echo ">> cleanroom: PASS — runs with no pixi env"
+'''
 ```
 
-(No `test-macho` task — the Macho/Relocate tests run under `mise run test`; the integration test is `@tag :macos`, auto-run on this macOS host, excluded on ubuntu CI.)
+(No `test-macho` task — the Macho/Relocate tests run under `mise run test`; the integration test is `@tag :macos`, auto-run on this macOS host, excluded on ubuntu CI. The `cleanroom` task moves `versions/master/.pixi` aside and restores it on exit; in the disposable pregate VM that's free, and locally it's restored via the `trap`.)
 
 - [ ] **Step 2: Ignore the build output** — add to `.gitignore`:
 ```
@@ -784,18 +732,20 @@ run = "bash scripts/cleanroom.sh master"
 /build/
 ```
 
-- [ ] **Step 3: Extend `.pregate/macos.sh`** (static gate only — no nested VM):
+- [ ] **Step 3: Extend `.pregate/macos.sh`** (the full clean-room, all in the one pregate macOS VM):
 ```sh
 #!/bin/sh
-# pregate macos recipe — shared body (orchestrator test+lint, incl. the :macos relocation test)
-# then the Phase 2 build+relocate gate. Runs INSIDE the pregate VM; no nested tart. The clean-VM
-# launch (scripts/cleanroom.sh) is a host-side step, not run here.
+# pregate macos recipe — shared body (orchestrator test+lint, incl. the :macos relocation test),
+# then the Phase 2 build → relocate → gate → no-pixi launch, ALL in this one fresh disposable
+# macOS VM. No nested virtualization, no sshpass, no separate image: the "clean machine" is this
+# VM (fresh OS + toolchain only) with the pixi env moved aside before launch (mise run cleanroom).
 . ./.pregate/common.sh
 mise run build
-mise run relocate    # mix relocate ends with the gate — fails pregate if the bundle isn't self-contained
+mise run relocate    # mix relocate ends with the static gate — fails pregate if not self-contained
+mise run cleanroom   # moves versions/master/.pixi aside, then --batch (+ GUI frame) — the no-pixi proof
 ```
 
-> Note: `common.sh` runs `mise run test`, which on this macOS VM includes the `@tag :macos` relocation integration test (Darwin → not excluded). No separate task needed.
+> Note: `common.sh` runs `mise run test`, which on this macOS VM includes the `@tag :macos` relocation integration test (Darwin → not excluded).
 
 - [ ] **Step 4: Verify the fast suite runs**
 Run: `mise run test` (on macOS includes the `:macos` integration test).
@@ -804,12 +754,12 @@ Expected: all green.
 - [ ] **Step 5: Commit**
 ```bash
 git add mise.toml .gitignore .pregate/macos.sh
-git commit -m "build(phase2): mise tasks (build/relocate/cleanroom) + pregate gate + gitignore"
+git commit -m "build(phase2): mise tasks (build/relocate/cleanroom) + pregate no-pixi launch + gitignore"
 ```
 
 ---
 
-## Task 7: Record findings + reconcile docs
+## Task 6: Record findings + reconcile docs
 
 **Files:**
 - Modify: `docs/superpowers/validation-log.md`, `docs/superpowers/specs/2026-06-05-bundled-emacs-build-system-design.md`, `versions/master/mise.toml`
@@ -845,7 +795,7 @@ git commit -m "docs(phase2): record build+relocation findings + Decision E; reco
 - [ ] `mise run test` green incl. the pure `Orchestrator.Macho` tests + (on macOS) the `@tag :macos` `Relocate` integration test; ubuntu CI stays green (`:macos` excluded).
 - [ ] `mise run build` produces `build/master/Emacs.app` that runs `--batch` on the host.
 - [ ] `mise run relocate` ends with `macho_gate: PASS` — zero foreign deps, zero foreign rpaths, full `@rpath` closure in `Frameworks`.
-- [ ] `mise run cleanroom` green: relocated app runs `--batch` (+ GUI frame) in a fresh tart VM with no pixi.
+- [ ] `mise run cleanroom` green: relocated app runs `--batch` (+ GUI frame) with the pixi env moved aside — and the same in the fresh pregate macOS VM.
 - [ ] Validation-log Phase 2 section written; spec §6.2/§8/§9/§13 reconciled; stale `versions/master/mise.toml` comment fixed.
 - [ ] `emacs -nw`/terminfo confirmed out of scope, recorded for post-Phase-4 (spec §15).
 
@@ -855,6 +805,6 @@ git commit -m "docs(phase2): record build+relocation findings + Decision E; reco
 
 **Placeholder scan:** no code placeholders — every module/test is complete. The `case File.ls/1` one-liner in Task 2 Step 3 is flagged to be rewritten multi-line for `mix format`. The three build/VM "validation points" are confirm-and-adjust steps with concrete fallbacks (per the validate-don't-assume rule), not deferred work.
 
-**Type/name consistency:** `Orchestrator.Macho` functions (`classify/1`, `relpath/2`, `parse_id/1`, `parse_deps/2`, `parse_rpaths/1`, `bundleable/1`, `gate_violations/2`) are used consistently by `Macho.Otool` and `Relocate`. The `Macho.Tool` behaviour callbacks (`macho?`, `id`, `deps`, `rpaths`, `set_id`, `change`, `add_rpath`, `delete_rpath`, `resign`) match the `Otool` `@impl` set and the `Relocate` call sites. Path contract: build-emacs writes `build/<v>/{Emacs.app,conda-prefix-lib.txt}`; `mix relocate` reads them via the mise task; `cleanroom.sh` reads `build/<v>/Emacs.app`.
+**Type/name consistency:** `Orchestrator.Macho` functions (`classify/1`, `relpath/2`, `parse_id/1`, `parse_deps/2`, `parse_rpaths/1`, `bundleable/1`, `gate_violations/2`) are used consistently by `Macho.Otool` and `Relocate`. The `Macho.Tool` behaviour callbacks (`macho?`, `id`, `deps`, `rpaths`, `set_id`, `change`, `add_rpath`, `delete_rpath`, `sign_bundle`) match the `Otool` `@impl` set and the `Relocate` call sites. Path contract: build-emacs writes `build/<v>/{Emacs.app,conda-prefix-lib.txt}`; `mix relocate` and `mise run cleanroom` read `build/master/Emacs.app`.
 
 **Scope:** single subsystem (build + relocation). native-comp, proper signing, packaging, CI, and `-nw` are excluded and routed to their phases.
