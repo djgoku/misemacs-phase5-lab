@@ -45,4 +45,16 @@ eq "relpath FW->FW"    "$(macho_relpath "$T/App.app/Contents/Frameworks" "$T/App
 # 6. gate FAILS before relocation (foreign rpath; @rpath deps not in Frameworks)
 if macho_gate "$T/App.app" >/dev/null 2>&1; then bad "gate should fail pre-reloc"; else ok "gate fails pre-reloc"; fi
 
+# 7. space-tolerant parsing (regression): a dep/rpath whose path contains a space survives intact.
+# libsp exports bar(); spmain calls bar() so the link against -lsp resolves.
+mkdir -p "$T/sp ace/lib"
+clang -dynamiclib -install_name '@rpath/libsp.dylib' -Wl,-headerpad_max_install_names \
+      "$T/bar.c" -o "$T/sp ace/lib/libsp.dylib"
+printf 'int bar(void); int main(void){return bar()-5;}\n' > "$T/spmain.c"
+SPEXE="$T/App.app/Contents/MacOS/SpApp"
+clang -Wl,-headerpad_max_install_names -L"$T/sp ace/lib" -lsp -Wl,-rpath,"$T/sp ace/lib" \
+      "$T/spmain.c" -o "$SPEXE"
+macho_deps   "$SPEXE" | grep -qxF "@rpath/libsp.dylib" && ok "deps: name intact" || bad "deps: name intact"
+macho_rpaths "$SPEXE" | grep -qxF "$T/sp ace/lib"      && ok "rpaths: space path intact" || bad "rpaths: space path intact"
+
 echo "macho_test: $pass passed, $fail failed"; [ "$fail" = 0 ]

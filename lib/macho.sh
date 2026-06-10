@@ -10,18 +10,21 @@ macho_is_macho() { [ -f "$1" ] && file -b "$1" 2>/dev/null | grep -q 'Mach-O'; }
 macho_id() { otool -D "$1" 2>/dev/null | awk 'NR==2{print}'; }
 
 # All linked dylib install-names of $1, excluding the file's own id.
+# Space-tolerant: strip leading ws + the trailing " (compatibility version ...)" rather than awk $1.
 macho_deps() {
   local self; self="$(macho_id "$1")"
   if [ -n "$self" ]; then
-    otool -L "$1" 2>/dev/null | awk 'NR>1{print $1}' | grep -vxF "$self" || true
+    otool -L "$1" 2>/dev/null | awk 'NR>1' | sed -E 's/^[[:space:]]+//; s/ \(compatibility version .*$//' | grep -vxF "$self" || true
   else
-    otool -L "$1" 2>/dev/null | awk 'NR>1{print $1}'
+    otool -L "$1" 2>/dev/null | awk 'NR>1' | sed -E 's/^[[:space:]]+//; s/ \(compatibility version .*$//' || true
   fi
 }
 
-# LC_RPATH entries of $1.
+# LC_RPATH entries of $1. Space-tolerant: strip the "path " prefix and " (offset N)" suffix.
 macho_rpaths() {
-  otool -l "$1" 2>/dev/null | awk '/^ *cmd LC_RPATH$/{r=1;next} r&&/^ *path /{print $2;r=0}'
+  otool -l "$1" 2>/dev/null | awk '
+    /^ *cmd LC_RPATH$/ {r=1; next}
+    r && /^ *path / { sub(/^ *path /,""); sub(/ \(offset [0-9]+\)$/,""); print; r=0 }'
 }
 
 # Classify a path:
