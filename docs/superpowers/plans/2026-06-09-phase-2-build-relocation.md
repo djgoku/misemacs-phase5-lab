@@ -4,369 +4,587 @@
 
 **Goal:** Build a self-contained, relocatable **GUI** `Emacs.app` from the per-version pixi env that launches on a clean macOS arm64 machine with no pixi/conda/Homebrew present.
 
-**Architecture:** Two bash pipeline stages — `pipeline/build-emacs` (configure+make+install against the locked pixi env) and `pipeline/bundle-relocate` (a generic Mach-O closure walk that copies every non-system dylib into `Contents/Frameworks`, fixes install-names/rpaths to be bundle-relative, and ad-hoc re-signs) — plus a shared, fixture-tested helper library `lib/macho.sh` that includes the self-contained **gate**. Proof of done: the static `macho_gate` is green AND the relocated app runs `--batch` (+ a GUI frame smoke) inside a fresh tart VM that never had pixi.
+**Architecture (hybrid — 2026-06-09 decision):** The **build** is a bash stage (`pipeline/build-emacs`: enter the pixi env, `autogen → configure → make → make install`). The **relocation + gate** is **Elixir**, in the existing orchestrator app, following the project's pure-core + IO-adapter pattern (spec D4/§7.1): `Orchestrator.Macho` (pure: classify paths, compute the dylib closure, evaluate the gate) + `Orchestrator.Macho.Tool` behaviour with the `Orchestrator.Macho.Otool` IO adapter (otool/install_name_tool/codesign) + `Orchestrator.Relocate` (the runner) + a `mix relocate` task. Generic over all Mach-O — ncurses bundled, no terminfo work (GUI-only). Proof of done: the gate returns no violations AND the relocated app runs `--batch` (+ a GUI frame smoke) inside a fresh tart VM that never had pixi.
 
-**Tech Stack:** bash, `otool`/`install_name_tool`/`codesign` (Xcode CLT), pixi (locked build env), mise (tasks + toolchain), tart 2.31.0 (clean-room VM), clang (test fixtures).
+**Tech Stack:** Elixir 1.20 / ExUnit (relocation logic + gate, in `orchestrator/`); bash + `otool`/`install_name_tool`/`codesign` shelled from Elixir via `System.cmd`; bash for the build stage (under `pixi run`); mise (tasks + toolchain); tart 2.31.0 (clean-room VM); clang (test fixtures).
 
 ---
 
-## Decisions frozen here (the 2026-06-09 brainstorm outcome)
+## Decisions frozen here (the 2026-06-09 brainstorm + hybrid-language outcome)
 
-These were settled with the user during brainstorming; the umbrella spec (`docs/superpowers/specs/2026-06-05-bundled-emacs-build-system-design.md`) is reconciled to match in Task 7.
+These were settled with the user; the umbrella spec (`docs/superpowers/specs/2026-06-05-bundled-emacs-build-system-design.md`) is reconciled to match in Task 7.
 
-- **GUI-only.** v1 deliverable is the NS `Emacs.app`. The GUI never initializes terminfo, so `bundle-relocate` is a **pure generic Mach-O walk with zero special-cases** — ncurses is bundled like any other dylib (its dylib only needs to *resolve* at load).
-- **`emacs -nw` is out of scope** and recorded in spec §15 as a **post-Phase-4 fast-follow** (one-row system-rewrite of `libncurses` → `/usr/lib/libncurses.5.4.dylib`). Validated 2026-06-09: a *bundled* conda ncurses 6.6 searches only `$CONDA_PREFIX/share/terminfo` (`infocmp -D`), so `-nw` would need that rewrite or a `TERMINFO_DIRS` launcher. **Do not** add terminfo handling in Phase 2.
-- **Decision C — minimal ad-hoc re-sign lives in Phase 2.** `install_name_tool` invalidates code signatures and arm64 kills an invalid-sig binary, so `bundle-relocate` ad-hoc re-signs (`codesign -s - -f`) every Mach-O it rewrites. Proper/deep/Developer-ID signing remains Phase 3.
+- **GUI-only.** v1 deliverable is the NS `Emacs.app`. The GUI never initializes terminfo, so relocation is a **generic Mach-O closure walk with zero special-cases** — ncurses is bundled like any other dylib (its dylib only needs to *resolve* at load).
+- **`emacs -nw` is out of scope**, recorded in spec §15 as a **post-Phase-4 fast-follow** (one-row system-rewrite of `libncurses` → `/usr/lib/libncurses.5.4.dylib`). Validated 2026-06-09: a *bundled* conda ncurses 6.6 searches only `$CONDA_PREFIX/share/terminfo` (`infocmp -D`). **Do not** add terminfo handling in Phase 2.
+- **Language split (hybrid).** Build = bash (glue); relocation + gate = Elixir (decisions), per D4/§7.1. The relocation *logic* (classify / closure / gate rules) is pure and ExUnit-tested; the IO (otool/install_name_tool/codesign) is a `System.cmd` adapter behind a behaviour, so the core is tested with fixture strings and the adapter is swappable in tests. This replaces the initial bash `lib/macho.sh` (commits `fadcc3d`/`d78fe88`), whose validated logic is ported verbatim — Task 1 removes the bash files.
+- **Cross-platform tests.** Orchestrator CI is **ubuntu** (`orchestrator-ci.yml` runs `mise run test`). Pure relocation tests run everywhere; the real-binary integration test is `@tag :macos` and excluded off Darwin via `test_helper.exs`.
+- **Decision C — minimal ad-hoc re-sign lives in Phase 2.** `install_name_tool` invalidates code signatures and arm64 kills an invalid-sig binary, so the runner ad-hoc re-signs (`codesign -s - -f`) every Mach-O it rewrites. Proper/Developer-ID signing remains Phase 3.
 - **Decision D — `bin/` move + Info.plist/icon stay in Phase 4.** Phase 2 relocates whatever Mach-O `make install` produces, in their default locations.
-- **Decision E — the host `make`/CLT fingerprint gap (spec §8): record now, wire in Phase 5.** Resolution recorded in Task 7: fold `xcode-select -p` + the active clang/SDK build version into `toolchain_hash` when the fingerprint is consumed (Phase 5). No code in Phase 2.
-- **rpath ownership.** `build-emacs` adds only `-Wl,-headerpad_max_install_names` and `-Wl,-rpath,$CONDA_PREFIX/lib` (the latter solely so the in-build dump step can load conda dylibs — Phase-1 finding). `bundle-relocate` adds the depth-correct `@loader_path/<rel-to-Frameworks>` rpath to every Mach-O and deletes the `$CONDA_PREFIX/lib` rpath. (Refines spec §9, which sketched `@executable_path/../Frameworks` and omitted the build-time conda rpath.)
-- **Clean-VM proof is host-side.** `mise run cleanroom` clones a fresh tart VM (no pixi) and launches the relocated app. pregate (itself a VM; no nested virt) runs build + relocate + the static `macho_gate` instead.
+- **Decision E — host `make`/CLT fingerprint gap (spec §8): record now, wire in Phase 5.** Resolution in Task 7: fold `xcode-select -p` + the active clang/SDK build version into `toolchain_hash` when the fingerprint is consumed (Phase 5). No code in Phase 2.
+- **rpath ownership.** `build-emacs` adds only `-Wl,-headerpad_max_install_names` and `-Wl,-rpath,$CONDA_PREFIX/lib` (the latter solely so the in-build dump step can load conda dylibs — Phase-1 finding). `Orchestrator.Relocate` adds the depth-correct `@loader_path/<rel-to-Frameworks>` rpath to every Mach-O and deletes the foreign (`$CONDA_PREFIX/lib`) rpath. (Refines spec §9.)
+- **Clean-VM proof is host-side.** `mise run cleanroom` clones a fresh tart VM (no pixi). pregate (itself a VM; no nested virt) runs build + relocate + the static gate.
 
 ## File Structure
 
 | Path | New? | Responsibility |
 |---|---|---|
-| `lib/macho.sh` | create | Sourced helpers over `otool`/`install_name_tool`/`codesign` + `macho_gate` (the self-contained check). Pure host tools, no pixi. |
-| `tests/macho_test.sh` | create | Unit tests for `lib/macho.sh` using tiny clang fixtures (fast, no Emacs build). |
-| `pipeline/bundle-relocate` | create | The crux: generic Mach-O closure walk → `Contents/Frameworks`, rpath/install-name fixes, re-sign, ends with `macho_gate`. |
-| `tests/bundle-relocate_test.sh` | create | Integration test of `bundle-relocate` against a synthetic 2-level conda-style bundle; proves it runs with the build libdir moved aside (clean-machine proxy). |
-| `pipeline/build-emacs` | create | Fetch + configure + make + install under the pixi env → `build/<v>/Emacs.app` + `conda-prefix-lib.txt` + an otool discovery dump. |
-| `scripts/cleanroom.sh` | create | Host-side tart-VM DoD proof: copy the relocated app into a fresh no-pixi VM and run `--batch` + a GUI frame smoke. |
-| `mise.toml` | modify | Add tasks `build`, `relocate`, `test-macho`, `cleanroom`. |
-| `.gitignore` | modify | Ignore `/build/` (the ephemeral build/relocate output). |
-| `.pregate/macos.sh` | modify | After the shared body: `test-macho` + `build` + `relocate` (static gate). No nested VM. |
-| `versions/master/mise.toml` | modify | Fix the now-stale "ncurses = system /usr/lib" comment (Task 7). |
-| `docs/superpowers/validation-log.md` | modify | Phase 2 findings + decision E (Task 7). |
-| `docs/superpowers/specs/2026-06-05-…-design.md` | modify | Reconcile §6.2/§8/§9/§13 (Task 7). |
+| `orchestrator/lib/orchestrator/macho.ex` | create | **Pure** Mach-O reasoning: `classify/1`, `relpath/2`, `parse_id/1`, `parse_deps/2`, `parse_rpaths/1`, `bundleable/1`, `gate_violations/2`. No IO. |
+| `orchestrator/lib/orchestrator/macho/tool.ex` | create | The IO **behaviour** (`@callback` for macho?/id/deps/rpaths/set_id/change/add_rpath/delete_rpath/resign). |
+| `orchestrator/lib/orchestrator/macho/otool.ex` | create | Default IO **adapter** — shells `otool`/`install_name_tool`/`codesign` via `System.cmd`, parses with `Orchestrator.Macho`. |
+| `orchestrator/lib/orchestrator/relocate.ex` | create | The runner: BFS the closure into `Contents/Frameworks`, normalize ids/refs, fix rpaths, re-sign, gate. Reasoning via `Macho`, IO via a `Tool` (default `Otool`). |
+| `orchestrator/lib/mix/tasks/relocate.ex` | create | `mix relocate <app> <build_libdir>` entrypoint → `Orchestrator.Relocate.run/2`. |
+| `orchestrator/test/orchestrator/macho_test.exs` | create | Pure tests (run everywhere): classify/relpath/parse/bundleable/gate_violations with fixture strings. |
+| `orchestrator/test/orchestrator/relocate_test.exs` | create | `@tag :macos` integration: clang-built fixture bundle → `Relocate.run` → gate ok + runs with build libdir moved aside. |
+| `orchestrator/test/test_helper.exs` | modify | Exclude `:macos` tests off Darwin. |
+| `lib/macho.sh`, `tests/macho_test.sh` | **delete** | Superseded by the Elixir modules (Task 1 `git rm`s them). |
+| `pipeline/build-emacs` | create | Fetch + configure + make + install under the pixi env → `build/<v>/Emacs.app` + `conda-prefix-lib.txt` + otool discovery dump. |
+| `scripts/cleanroom.sh` | create | Host-side tart-VM DoD proof: `--batch` + GUI frame smoke in a fresh no-pixi VM. |
+| `mise.toml` | modify | Add tasks `build`, `relocate` (→ `mix relocate`), `cleanroom`. (No `test-macho` — the Elixir tests run under `mise run test`.) |
+| `.gitignore` | modify | Ignore `/build/`. |
+| `.pregate/macos.sh` | modify | After the shared body: `mise run build` + `mise run relocate` (static gate). No nested VM. |
+| `versions/master/mise.toml` | modify | Fix the stale "ncurses = system /usr/lib" comment (Task 7). |
+| `docs/superpowers/validation-log.md`, `docs/.../2026-06-05-…-design.md` | modify | Phase 2 findings + Decision E + spec reconcile (Task 7). |
 
-**Conventions to follow (from Phase 0/1):** stages are standalone bash invoked as `bash pipeline/<stage> <version>`; they read `EMACS_REF`/`EMACS_CONFIGURE_FLAGS` from `versions/<v>/mise.toml` via `mise exec`; the pixi env is entered with `mise exec -- pixi run --manifest-path "$VDIR/pixi.toml"` (the validated direct-pixi path from `scripts/configure-check.sh`). Commit after each task.
+**Conventions (from the orchestrator):** modules carry `@moduledoc`/`@type`/`@spec`/`@doc`; tests `use ExUnit.Case, async: true` with `alias`; pure logic has no IO and is fixture-tested; build stages are bash invoked as `bash pipeline/<stage> <version>`, reading `EMACS_REF`/`EMACS_CONFIGURE_FLAGS` from `versions/<v>/mise.toml` via `mise exec`, entering the pixi env with `mise exec -- pixi run --manifest-path "$VDIR/pixi.toml"`. Commit after each task.
 
 ## Branch setup (already done)
 
-Work happens on the existing worktree branch `claude/modest-payne-854333` (worktree root `/Users/dj_goku/dev/github/djgoku/misemacs/.claude/worktrees/modest-payne-854333`). All paths below are relative to that root. Do **not** push or rebase (the user owns those).
+Worktree branch `claude/modest-payne-854333` (root `/Users/dj_goku/dev/github/djgoku/misemacs/.claude/worktrees/modest-payne-854333`). All paths relative to that root. Do **not** push or rebase.
 
 ---
 
-## Task 1: `lib/macho.sh` — Mach-O helpers + the self-contained gate (TDD)
+## Task 1: `Orchestrator.Macho` — pure Mach-O reasoning + IO adapter (TDD)
+
+Port the validated behavior of the committed bash `lib/macho.sh` (commits `fadcc3d`, `d78fe88`) into Elixir, then remove the bash files. The pure module is the testable core; the adapter is the IO edge.
 
 **Files:**
-- Create: `lib/macho.sh`
-- Test: `tests/macho_test.sh`
+- Create: `orchestrator/lib/orchestrator/macho.ex`, `orchestrator/lib/orchestrator/macho/tool.ex`, `orchestrator/lib/orchestrator/macho/otool.ex`
+- Test: `orchestrator/test/orchestrator/macho_test.exs`
+- Modify: `orchestrator/test/test_helper.exs`
+- Delete: `lib/macho.sh`, `tests/macho_test.sh`
 
-- [ ] **Step 1: Write the failing test**
+- [ ] **Step 1: Write the failing pure test** — create `orchestrator/test/orchestrator/macho_test.exs`:
 
-Create `tests/macho_test.sh`:
+```elixir
+defmodule Orchestrator.MachoTest do
+  use ExUnit.Case, async: true
+  alias Orchestrator.Macho
 
-```bash
-#!/usr/bin/env bash
-# Unit tests for lib/macho.sh — tiny clang fixtures (fast; no Emacs build).
-set -euo pipefail
-HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-. "$HERE/lib/macho.sh"
-T="$(mktemp -d)"; trap 'rm -rf "$T"' EXIT
-pass=0; fail=0
-ok()  { echo "  ok   $1"; pass=$((pass+1)); }
-bad() { echo "  FAIL $1"; fail=$((fail+1)); }
-eq()  { [ "$2" = "$3" ] && ok "$1" || bad "$1 (got '$2' want '$3')"; }
+  # Realistic otool fixture strings (captured shape; arm64).
+  @otool_l """
+  /p/App.app/Contents/MacOS/App:
+  \t@rpath/libfoo.dylib (compatibility version 0.0.0, current version 0.0.0)
+  \t/usr/lib/libSystem.B.dylib (compatibility version 1.0.0, current version 1351.0.0)
+  """
+  @otool_l_dylib """
+  /build/lib/libfoo.dylib:
+  \t@rpath/libfoo.dylib (compatibility version 0.0.0, current version 0.0.0)
+  \t@rpath/libbar.dylib (compatibility version 0.0.0, current version 0.0.0)
+  """
+  @otool_d "/build/lib/libfoo.dylib:\n@rpath/libfoo.dylib\n"
+  @otool_d_exe "/p/App.app/Contents/MacOS/App:\n"
+  @otool_l_rpath """
+  Load command 12
+            cmd LC_RPATH
+        cmdsize 32
+           path /build dir/lib (offset 12)
+  Load command 13
+            cmd LC_RPATH
+        cmdsize 40
+           path @loader_path/../Frameworks (offset 12)
+  """
 
-# fixtures: 'conda-style' dylibs with @rpath ids in a build libdir; an app exe with a foreign rpath.
-mkdir -p "$T/buildlib" "$T/App.app/Contents/MacOS" "$T/App.app/Contents/Frameworks"
-printf 'int bar(void){return 5;}\n' > "$T/bar.c"
-clang -dynamiclib -install_name '@rpath/libbar.dylib' -Wl,-headerpad_max_install_names \
-      "$T/bar.c" -o "$T/buildlib/libbar.dylib"
-printf 'int bar(void); int foo(void){return bar()+2;}\n' > "$T/foo.c"
-clang -dynamiclib -install_name '@rpath/libfoo.dylib' -Wl,-headerpad_max_install_names \
-      -L"$T/buildlib" -lbar -Wl,-rpath,"$T/buildlib" "$T/foo.c" -o "$T/buildlib/libfoo.dylib"
-printf 'int foo(void); int main(void){return foo()-7;}\n' > "$T/main.c"
-EXE="$T/App.app/Contents/MacOS/App"
-clang -Wl,-headerpad_max_install_names -L"$T/buildlib" -lfoo -Wl,-rpath,"$T/buildlib" \
-      "$T/main.c" -o "$EXE"
+  test "classify" do
+    assert Macho.classify("/usr/lib/libSystem.B.dylib") == :system
+    assert Macho.classify("/System/Library/Frameworks/AppKit") == :system
+    assert Macho.classify("@rpath/libfoo.dylib") == :bundled
+    assert Macho.classify("@loader_path/../Frameworks") == :bundled
+    assert Macho.classify("/opt/homebrew/lib/libx.dylib") == :foreign
+    assert Macho.classify("librelative.dylib") == :other
+  end
 
-# 1. is_macho
-macho_is_macho "$EXE"      && ok "is_macho exe"            || bad "is_macho exe"
-macho_is_macho "$T/main.c" && bad "is_macho rejects src"   || ok "is_macho rejects src"
+  test "relpath" do
+    assert Macho.relpath("/a/App/Contents/Frameworks", "/a/App/Contents/MacOS") == "../Frameworks"
+    assert Macho.relpath("/a/App/Contents/Frameworks", "/a/App/Contents/MacOS/bin") == "../../Frameworks"
+    assert Macho.relpath("/a/App/Contents/Frameworks", "/a/App/Contents/Frameworks") == "."
+  end
 
-# 2. class
-eq "class system"  "$(macho_class /usr/lib/libSystem.B.dylib)" system
-eq "class bundled" "$(macho_class @rpath/libfoo.dylib)"        bundled
-eq "class foreign" "$(macho_class "$T/buildlib/libfoo.dylib")" foreign
+  test "parse_id" do
+    assert Macho.parse_id(@otool_d) == "@rpath/libfoo.dylib"
+    assert Macho.parse_id(@otool_d_exe) == nil
+  end
 
-# 3. deps lists @rpath dep, excludes the dylib's own id
-macho_deps "$T/buildlib/libfoo.dylib" | grep -qx '@rpath/libbar.dylib' && ok "deps libbar" || bad "deps libbar"
-macho_deps "$T/buildlib/libfoo.dylib" | grep -qx '@rpath/libfoo.dylib' && bad "deps exclude self" || ok "deps exclude self"
+  test "parse_deps excludes self id, keeps system + @rpath" do
+    assert Macho.parse_deps(@otool_l, nil) ==
+             ["@rpath/libfoo.dylib", "/usr/lib/libSystem.B.dylib"]
+    assert Macho.parse_deps(@otool_l_dylib, "@rpath/libfoo.dylib") == ["@rpath/libbar.dylib"]
+  end
 
-# 4. rpaths
-macho_rpaths "$EXE" | grep -qx "$T/buildlib" && ok "rpath present" || bad "rpath present"
+  test "parse_rpaths is space-tolerant" do
+    assert Macho.parse_rpaths(@otool_l_rpath) == ["/build dir/lib", "@loader_path/../Frameworks"]
+  end
 
-# 5. relpath
-eq "relpath MacOS->FW" "$(macho_relpath "$T/App.app/Contents/Frameworks" "$T/App.app/Contents/MacOS")" "../Frameworks"
-eq "relpath FW->FW"    "$(macho_relpath "$T/App.app/Contents/Frameworks" "$T/App.app/Contents/Frameworks")" "."
+  test "bundleable = foreign + @rpath only" do
+    deps = ["@rpath/libfoo.dylib", "/usr/lib/libSystem.B.dylib", "/opt/homebrew/lib/libx.dylib"]
+    assert Macho.bundleable(deps) == ["@rpath/libfoo.dylib", "/opt/homebrew/lib/libx.dylib"]
+  end
 
-# 6. gate FAILS before relocation (foreign rpath; @rpath deps not in Frameworks)
-if macho_gate "$T/App.app" >/dev/null 2>&1; then bad "gate should fail pre-reloc"; else ok "gate fails pre-reloc"; fi
+  test "gate_violations: foreign dep, missing @rpath lib, foreign rpath" do
+    machos = [
+      %{path: "exe", deps: ["@rpath/libfoo.dylib", "/opt/x/liby.dylib"], rpaths: ["/build/lib"]},
+      %{path: "ok", deps: ["@rpath/libfoo.dylib", "/usr/lib/libSystem.B.dylib"], rpaths: ["@loader_path/../Frameworks"]}
+    ]
+    fw = MapSet.new(["libfoo.dylib"])
+    v = Macho.gate_violations(machos, fw)
+    assert {:foreign_dep, "exe", "/opt/x/liby.dylib"} in v
+    assert {:foreign_rpath, "exe", "/build/lib"} in v
+    refute Enum.any?(v, &match?({:missing_lib, _, _}, &1))
+    # missing case:
+    assert {:missing_lib, "z", "@rpath/libgone.dylib"} in
+             Macho.gate_violations([%{path: "z", deps: ["@rpath/libgone.dylib"], rpaths: []}], fw)
+  end
 
-echo "macho_test: $pass passed, $fail failed"; [ "$fail" = 0 ]
+  test "gate_violations empty == self-contained" do
+    machos = [%{path: "ok", deps: ["@rpath/libfoo.dylib", "/usr/lib/libSystem.B.dylib"], rpaths: ["@loader_path/../Frameworks"]}]
+    assert Macho.gate_violations(machos, MapSet.new(["libfoo.dylib"])) == []
+  end
+end
 ```
 
 - [ ] **Step 2: Run it and watch it fail**
+Run: `mise exec -- sh -c 'cd orchestrator && mix test test/orchestrator/macho_test.exs'`
+Expected: FAIL — `Orchestrator.Macho` undefined / module not found.
 
-Run: `bash tests/macho_test.sh`
-Expected: FAIL — `lib/macho.sh` does not exist (`. "$HERE/lib/macho.sh": No such file or directory`).
+- [ ] **Step 3: Write the pure module** — `orchestrator/lib/orchestrator/macho.ex`:
 
-- [ ] **Step 3: Write `lib/macho.sh`**
+```elixir
+defmodule Orchestrator.Macho do
+  @moduledoc """
+  Pure Mach-O reasoning for relocation: classify install-name paths, compute relative
+  rpaths, parse `otool` output, and evaluate the self-contained gate. No IO — the IO edge
+  (otool/install_name_tool/codesign) is `Orchestrator.Macho.Otool` behind the
+  `Orchestrator.Macho.Tool` behaviour (spec §7.1: pure core + IO adapter). Ports the
+  validated bash `lib/macho.sh` logic (including its space-tolerant otool parsing).
+  """
 
-```bash
-#!/usr/bin/env bash
-# lib/macho.sh — Mach-O relocation helpers + the self-contained gate.
-# Sourced by pipeline/bundle-relocate and tests/macho_test.sh.
-# Host tools only (otool/install_name_tool/codesign from Xcode CLT) — NO pixi/conda.
+  @type class :: :system | :bundled | :foreign | :other
+  @type macho :: %{path: String.t(), deps: [String.t()], rpaths: [String.t()]}
+  @type violation ::
+          {:foreign_dep, String.t(), String.t()}
+          | {:missing_lib, String.t(), String.t()}
+          | {:foreign_rpath, String.t(), String.t()}
 
-# True if $1 is a Mach-O file.
-macho_is_macho() { [ -f "$1" ] && file -b "$1" 2>/dev/null | grep -q 'Mach-O'; }
+  @doc "Classify a dependency/rpath path. See `t:class/0`."
+  @spec classify(String.t()) :: class
+  def classify("/usr/lib/" <> _), do: :system
+  def classify("/System/" <> _), do: :system
+  def classify("@rpath/" <> _), do: :bundled
+  def classify("@executable_path/" <> _), do: :bundled
+  def classify("@loader_path/" <> _), do: :bundled
+  def classify("/" <> _), do: :foreign
+  def classify(_), do: :other
 
-# The install-name id of a dylib (empty for a plain executable).
-macho_id() { otool -D "$1" 2>/dev/null | awk 'NR==2{print}'; }
+  @doc "Relative path to reach absolute dir `to` from absolute dir `from` (e.g. `../Frameworks`, `.`)."
+  @spec relpath(String.t(), String.t()) :: String.t()
+  def relpath(to, from) do
+    t = String.split(to, "/", trim: true)
+    f = String.split(from, "/", trim: true)
+    n = common_len(t, f, 0)
+    parts = List.duplicate("..", length(f) - n) ++ Enum.drop(t, n)
+    if parts == [], do: ".", else: Enum.join(parts, "/")
+  end
 
-# All linked dylib install-names of $1, excluding the file's own id.
-macho_deps() {
-  local self; self="$(macho_id "$1")"
-  if [ -n "$self" ]; then
-    otool -L "$1" 2>/dev/null | awk 'NR>1{print $1}' | grep -vxF "$self" || true
-  else
-    otool -L "$1" 2>/dev/null | awk 'NR>1{print $1}'
-  fi
-}
+  defp common_len([h | t1], [h | t2], n), do: common_len(t1, t2, n + 1)
+  defp common_len(_, _, n), do: n
 
-# LC_RPATH entries of $1.
-macho_rpaths() {
-  otool -l "$1" 2>/dev/null | awk '/^ *cmd LC_RPATH$/{r=1;next} r&&/^ *path /{print $2;r=0}'
-}
+  @doc "Parse `otool -D <file>` output → the install-name id, or nil for a plain executable."
+  @spec parse_id(String.t()) :: String.t() | nil
+  def parse_id(otool_d) do
+    case String.split(otool_d, "\n", trim: true) do
+      [_header, id | _] -> String.trim(id)
+      _ -> nil
+    end
+  end
 
-# Classify a path:
-#   system  → /usr/lib/* or /System/*                          (leave as-is)
-#   bundled → @rpath/* @executable_path/* @loader_path/*       (already bundle-relative)
-#   foreign → any other absolute path                          (build-tree/conda/homebrew → must fix)
-macho_class() {
-  case "$1" in
-    /usr/lib/*|/System/*) echo system ;;
-    @rpath/*|@executable_path/*|@loader_path/*) echo bundled ;;
-    /*) echo foreign ;;
-    *) echo other ;;
-  esac
-}
+  @doc """
+  Parse `otool -L <file>` output → dependency install-names, excluding `self_id`.
+  Space-tolerant: strips the trailing ` (compatibility version …)` rather than splitting on whitespace.
+  """
+  @spec parse_deps(String.t(), String.t() | nil) :: [String.t()]
+  def parse_deps(otool_l, self_id \\ nil) do
+    otool_l
+    |> String.split("\n", trim: true)
+    |> Enum.drop(1)
+    |> Enum.map(&dep_path/1)
+    |> Enum.reject(&(&1 in [nil, "", self_id]))
+  end
 
-# Relative path to reach absolute dir $1 from absolute dir $2 (e.g. ../Frameworks, ../../Frameworks, .).
-macho_relpath() {
-  awk -v t="$1" -v f="$2" 'BEGIN{
-    nt=split(t,T,"/"); nf=split(f,F,"/"); i=1;
-    while (i<=nt && i<=nf && T[i]==F[i]) i++;
-    up=""; for (j=i;j<=nf;j++) up=up "../";
-    down=""; for (j=i;j<=nt;j++) down=down T[j] (j<nt?"/":"");
-    r=up down; sub(/\/$/,"",r); if (r=="") r="."; print r;
-  }'
-}
+  defp dep_path(line) do
+    line
+    |> String.trim_leading()
+    |> String.replace(~r/ \(compatibility version .*$/, "")
+  end
 
-# --- mutators (thin install_name_tool / codesign wrappers) ---
-macho_set_id()       { install_name_tool -id "$2" "$1"; }
-macho_change()       { install_name_tool -change "$2" "$3" "$1"; }
-macho_add_rpath()    { install_name_tool -add_rpath "$2" "$1" 2>/dev/null || true; }   # idempotent: dup rpath is harmless
-macho_delete_rpath() { install_name_tool -delete_rpath "$2" "$1" 2>/dev/null || true; }
-macho_resign()       { codesign --remove-signature "$1" 2>/dev/null || true; codesign -s - -f "$1"; }  # ad-hoc (Decision C)
+  @doc "Parse `otool -l <file>` output → LC_RPATH paths. Space-tolerant."
+  @spec parse_rpaths(String.t()) :: [String.t()]
+  def parse_rpaths(otool_l), do: otool_l |> String.split("\n") |> rpaths([], false)
 
-# macho_gate <bundle_root>: assert self-contained. Prints offenders; non-zero on any violation.
-#   (1) no foreign dependency paths   (2) no foreign LC_RPATHs
-#   (3) every @rpath/<lib> dependency exists under <root>/Contents/Frameworks
-macho_gate() {
-  local root="$1" fw="$1/Contents/Frameworks" rc=0 f dep rp base
-  while IFS= read -r f; do
-    macho_is_macho "$f" || continue
-    while IFS= read -r dep; do
-      [ -n "$dep" ] || continue
-      case "$(macho_class "$dep")" in
-        foreign) echo "FOREIGN dep   $f -> $dep"; rc=1 ;;
-        bundled) case "$dep" in
-                   @rpath/*) base="${dep#@rpath/}"
-                     [ -e "$fw/$base" ] || { echo "MISSING lib   $f -> $dep"; rc=1; } ;;
-                 esac ;;
-      esac
-    done < <(macho_deps "$f")
-    while IFS= read -r rp; do
-      [ -n "$rp" ] || continue
-      [ "$(macho_class "$rp")" = foreign ] && { echo "FOREIGN rpath $f -> $rp"; rc=1; }
-    done < <(macho_rpaths "$f")
-  done < <(find "$root" -type f)
-  [ "$rc" = 0 ] && echo "macho_gate: PASS ($root self-contained)" || echo "macho_gate: FAIL ($root)"
-  return $rc
-}
+  defp rpaths([], acc, _in?), do: Enum.reverse(acc)
+
+  defp rpaths([line | rest], acc, in?) do
+    cond do
+      Regex.match?(~r/^\s*cmd LC_RPATH\s*$/, line) -> rpaths(rest, acc, true)
+      in? and Regex.match?(~r/^\s*path /, line) ->
+        p =
+          line
+          |> String.replace(~r/^\s*path /, "")
+          |> String.replace(~r/ \(offset \d+\)\s*$/, "")
+        rpaths(rest, [p | acc], false)
+      true -> rpaths(rest, acc, in?)
+    end
+  end
+
+  @doc "Deps that must be copied into Frameworks: `:foreign` or `@rpath/*`."
+  @spec bundleable([String.t()]) :: [String.t()]
+  def bundleable(deps) do
+    Enum.filter(deps, fn d -> classify(d) == :foreign or String.starts_with?(d, "@rpath/") end)
+  end
+
+  @doc """
+  Gate: given every Mach-O's parsed metadata and the basenames present in Frameworks,
+  return the list of violations (empty == self-contained).
+  """
+  @spec gate_violations([macho], MapSet.t(String.t())) :: [violation]
+  def gate_violations(machos, framework_basenames) do
+    Enum.flat_map(machos, fn %{path: p, deps: deps, rpaths: rpaths} ->
+      dep_v =
+        Enum.flat_map(deps, fn d ->
+          case classify(d) do
+            :foreign -> [{:foreign_dep, p, d}]
+            :bundled -> missing_lib(d, p, framework_basenames)
+            _ -> []
+          end
+        end)
+
+      rpath_v = for r <- rpaths, classify(r) == :foreign, do: {:foreign_rpath, p, r}
+      dep_v ++ rpath_v
+    end)
+  end
+
+  defp missing_lib("@rpath/" <> base, p, fw) do
+    if MapSet.member?(fw, base), do: [], else: [{:missing_lib, p, "@rpath/" <> base}]
+  end
+
+  defp missing_lib(_, _, _), do: []
+end
 ```
 
-- [ ] **Step 4: Run the test to verify it passes**
+- [ ] **Step 4: Run the pure test to verify it passes**
+Run: `mise exec -- sh -c 'cd orchestrator && mix test test/orchestrator/macho_test.exs'`
+Expected: PASS — 8 tests, 0 failures. If a parser assertion fails because real `otool` output differs from the fixture strings, FIX the parser (keep it space-tolerant); do not weaken assertions.
 
-Run: `bash tests/macho_test.sh`
-Expected: PASS — final line `macho_test: 11 passed, 0 failed`, exit 0.
+- [ ] **Step 5: Write the IO behaviour** — `orchestrator/lib/orchestrator/macho/tool.ex`:
 
-- [ ] **Step 5: Commit**
+```elixir
+defmodule Orchestrator.Macho.Tool do
+  @moduledoc "IO behaviour for Mach-O introspection + mutation (otool/install_name_tool/codesign)."
+  @callback macho?(Path.t()) :: boolean
+  @callback id(Path.t()) :: String.t() | nil
+  @callback deps(Path.t()) :: [String.t()]
+  @callback rpaths(Path.t()) :: [String.t()]
+  @callback set_id(Path.t(), String.t()) :: :ok
+  @callback change(Path.t(), String.t(), String.t()) :: :ok
+  @callback add_rpath(Path.t(), String.t()) :: :ok
+  @callback delete_rpath(Path.t(), String.t()) :: :ok
+  @callback resign(Path.t()) :: :ok
+end
+```
+
+- [ ] **Step 6: Write the default IO adapter** — `orchestrator/lib/orchestrator/macho/otool.ex`:
+
+```elixir
+defmodule Orchestrator.Macho.Otool do
+  @moduledoc "Default `Orchestrator.Macho.Tool` — shells host CLT tools, parses with `Orchestrator.Macho`."
+  @behaviour Orchestrator.Macho.Tool
+  alias Orchestrator.Macho
+
+  @impl true
+  def macho?(path) do
+    File.regular?(path) and
+      (case System.cmd("file", ["-b", path], stderr_to_stdout: true) do
+         {out, 0} -> String.contains?(out, "Mach-O")
+         _ -> false
+       end)
+  end
+
+  @impl true
+  def id(path), do: path |> run("otool", ["-D"]) |> Macho.parse_id()
+
+  @impl true
+  def deps(path), do: Macho.parse_deps(run(path, "otool", ["-L"]), id(path))
+
+  @impl true
+  def rpaths(path), do: path |> run("otool", ["-l"]) |> Macho.parse_rpaths()
+
+  @impl true
+  def set_id(path, new), do: int(path, ["-id", new])
+  @impl true
+  def change(path, old, new), do: int(path, ["-change", old, new])
+  @impl true
+  def add_rpath(path, rp), do: int_ok(path, ["-add_rpath", rp])
+  @impl true
+  def delete_rpath(path, rp), do: int_ok(path, ["-delete_rpath", rp])
+
+  @impl true
+  def resign(path) do
+    System.cmd("codesign", ["--remove-signature", path], stderr_to_stdout: true)
+    {_, 0} = System.cmd("codesign", ["-s", "-", "-f", path], stderr_to_stdout: true)
+    :ok
+  end
+
+  defp run(path, cmd, args) do
+    {out, _} = System.cmd(cmd, args ++ [path], stderr_to_stdout: true)
+    out
+  end
+
+  defp int(path, args) do
+    {_, 0} = System.cmd("install_name_tool", args ++ [path], stderr_to_stdout: true)
+    :ok
+  end
+
+  defp int_ok(path, args) do
+    System.cmd("install_name_tool", args ++ [path], stderr_to_stdout: true)
+    :ok
+  end
+end
+```
+
+> Note: the `macho?/1` body above has a deliberately odd `match?(... ) == false` guard placeholder that the implementer MUST replace with the clean version below — it is left so the implementer writes it correctly:
+> ```elixir
+> def macho?(path) do
+>   File.regular?(path) and
+>     (case System.cmd("file", ["-b", path], stderr_to_stdout: true) do
+>        {out, 0} -> String.contains?(out, "Mach-O")
+>        _ -> false
+>      end)
+> end
+> ```
+
+- [ ] **Step 7: Remove the superseded bash files + adjust `test_helper.exs`**
+
+`git rm lib/macho.sh tests/macho_test.sh`
+
+Edit `orchestrator/test/test_helper.exs` to exclude macOS-only tests off Darwin:
+```elixir
+exclude = if :os.type() == {:unix, :darwin}, do: [], else: [:macos]
+ExUnit.start(exclude: exclude)
+```
+
+- [ ] **Step 8: Full suite + format, then commit**
+Run: `mise run test` (runs `mix deps.get && mix test --warnings-as-errors` in orchestrator) and `mise run lint` (`mix format --check-formatted`). Run `mise run fmt` first if needed.
+Expected: all green (existing 46 + the new pure Macho tests), no warnings, formatted.
 
 ```bash
-git add lib/macho.sh tests/macho_test.sh
-git commit -m "feat(phase2): lib/macho.sh — Mach-O relocation helpers + self-contained gate"
+git add orchestrator/lib/orchestrator/macho.ex orchestrator/lib/orchestrator/macho/ \
+        orchestrator/test/orchestrator/macho_test.exs orchestrator/test/test_helper.exs
+git rm lib/macho.sh tests/macho_test.sh
+git commit -m "feat(phase2): Orchestrator.Macho pure reasoning + Tool/Otool IO adapter (replaces bash macho.sh)"
 ```
 
 ---
 
-## Task 2: `pipeline/bundle-relocate` — the generic relocation walk (TDD)
+## Task 2: `Orchestrator.Relocate` + `mix relocate` — the relocation runner (TDD)
 
 **Files:**
-- Create: `pipeline/bundle-relocate`
-- Test: `tests/bundle-relocate_test.sh`
+- Create: `orchestrator/lib/orchestrator/relocate.ex`, `orchestrator/lib/mix/tasks/relocate.ex`
+- Test: `orchestrator/test/orchestrator/relocate_test.exs` (`@tag :macos`)
 
-- [ ] **Step 1: Write the failing test**
+- [ ] **Step 1: Write the failing integration test** — `orchestrator/test/orchestrator/relocate_test.exs`:
 
-Create `tests/bundle-relocate_test.sh`:
+```elixir
+defmodule Orchestrator.RelocateTest do
+  use ExUnit.Case, async: false
+  @moduletag :macos
 
-```bash
-#!/usr/bin/env bash
-# Integration test: relocate a synthetic 2-level conda-style bundle, then prove it runs with the
-# build libdir MOVED ASIDE (clean-machine proxy) and that macho_gate passes. Fast — no Emacs build.
-set -euo pipefail
-HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-. "$HERE/lib/macho.sh"
-T="$(mktemp -d)"; trap 'rm -rf "$T"' EXIT
-APP="$T/build/master/Emacs.app"
-mkdir -p "$T/buildlib" "$APP/Contents/MacOS/bin"
+  setup do
+    t = Path.join(System.tmp_dir!(), "reloc-#{System.unique_integer([:positive])}")
+    File.mkdir_p!(Path.join([t, "buildlib"]))
+    File.mkdir_p!(Path.join([t, "App.app", "Contents", "MacOS", "bin"]))
+    on_exit(fn -> File.rm_rf!(t) end)
+    {:ok, t: t}
+  end
 
-# libbar <- libfoo <- {Emacs, bin/helper}, all @rpath via a build libdir.
-printf 'int bar(void){return 5;}\n' > "$T/bar.c"
-clang -dynamiclib -install_name '@rpath/libbar.dylib' -Wl,-headerpad_max_install_names \
-      "$T/bar.c" -o "$T/buildlib/libbar.dylib"
-printf 'int bar(void); int foo(void){return bar()+2;}\n' > "$T/foo.c"
-clang -dynamiclib -install_name '@rpath/libfoo.dylib' -Wl,-headerpad_max_install_names \
-      -L"$T/buildlib" -lbar -Wl,-rpath,"$T/buildlib" "$T/foo.c" -o "$T/buildlib/libfoo.dylib"
-printf 'int foo(void); int main(void){return foo()-7;}\n' > "$T/main.c"
-clang -Wl,-headerpad_max_install_names -L"$T/buildlib" -lfoo -Wl,-rpath,"$T/buildlib" \
-      "$T/main.c" -o "$APP/Contents/MacOS/Emacs"
-clang -Wl,-headerpad_max_install_names -L"$T/buildlib" -lfoo -Wl,-rpath,"$T/buildlib" \
-      "$T/main.c" -o "$APP/Contents/MacOS/bin/helper"
-printf '%s\n' "$T/buildlib" > "$T/build/master/conda-prefix-lib.txt"
+  defp clang!(args), do: {_, 0} = System.cmd("clang", args, stderr_to_stdout: true)
 
-# Run the stage with build root overridden to the fixture.
-BUILD_ROOT="$T/build" bash "$HERE/pipeline/bundle-relocate" master
+  test "relocate makes a fixture bundle self-contained; runs with build libdir moved aside", %{t: t} do
+    lib = Path.join(t, "buildlib")
+    app = Path.join(t, "App.app")
+    File.write!(Path.join(t, "bar.c"), "int bar(void){return 5;}\n")
+    File.write!(Path.join(t, "foo.c"), "int bar(void); int foo(void){return bar()+2;}\n")
+    File.write!(Path.join(t, "main.c"), "int foo(void); int main(void){return foo()-7;}\n")
+    clang!(["-dynamiclib", "-install_name", "@rpath/libbar.dylib", "-Wl,-headerpad_max_install_names",
+            Path.join(t, "bar.c"), "-o", Path.join(lib, "libbar.dylib")])
+    clang!(["-dynamiclib", "-install_name", "@rpath/libfoo.dylib", "-Wl,-headerpad_max_install_names",
+            "-L", lib, "-lbar", "-Wl,-rpath," <> lib, Path.join(t, "foo.c"), "-o", Path.join(lib, "libfoo.dylib")])
+    for out <- ["Contents/MacOS/App", "Contents/MacOS/bin/helper"] do
+      clang!(["-Wl,-headerpad_max_install_names", "-L", lib, "-lfoo", "-Wl,-rpath," <> lib,
+              Path.join(t, "main.c"), "-o", Path.join(app, out)])
+    end
 
-# Closure copied?
-[ -e "$APP/Contents/Frameworks/libfoo.dylib" ] && [ -e "$APP/Contents/Frameworks/libbar.dylib" ] \
-  || { echo "FAIL: closure not copied into Frameworks"; exit 1; }
-# Gate green?
-macho_gate "$APP"
-# Clean-machine proxy: remove the build libdir, then both binaries must still run (rc 0 == foo()==7).
-mv "$T/buildlib" "$T/buildlib.gone"
-"$APP/Contents/MacOS/Emacs";      echo "  Emacs ran rc=$?"
-"$APP/Contents/MacOS/bin/helper"; echo "  helper ran rc=$?"
-echo "bundle-relocate_test: PASS"
+    assert Orchestrator.Relocate.run(app, lib) == :ok
+    assert File.exists?(Path.join([app, "Contents", "Frameworks", "libfoo.dylib"]))
+    assert File.exists?(Path.join([app, "Contents", "Frameworks", "libbar.dylib"]))
+
+    # clean-machine proxy: remove the build libdir, both binaries must still run (rc 0 == foo()==7).
+    File.rename!(lib, lib <> ".gone")
+    for out <- ["Contents/MacOS/App", "Contents/MacOS/bin/helper"] do
+      assert {_, 0} = System.cmd(Path.join(app, out), [], stderr_to_stdout: true)
+    end
+  end
+end
 ```
 
 - [ ] **Step 2: Run it and watch it fail**
+Run: `mise exec -- sh -c 'cd orchestrator && mix test test/orchestrator/relocate_test.exs --include macos'`
+Expected: FAIL — `Orchestrator.Relocate` undefined.
 
-Run: `bash tests/bundle-relocate_test.sh`
-Expected: FAIL — `pipeline/bundle-relocate` does not exist (`No such file or directory`).
+- [ ] **Step 3: Write the runner** — `orchestrator/lib/orchestrator/relocate.ex`:
 
-- [ ] **Step 3: Write `pipeline/bundle-relocate`**
+```elixir
+defmodule Orchestrator.Relocate do
+  @moduledoc """
+  Make an `Emacs.app` self-contained: copy the non-system dylib closure into
+  `Contents/Frameworks`, normalize ids/refs to `@rpath`, give each Mach-O a depth-correct
+  `@loader_path` rpath, delete the build-time conda (foreign) rpath, ad-hoc re-sign
+  (Decision C), then gate. Generic over all Mach-O (no ncurses/terminfo special-case —
+  GUI-only, spec §15). Reasoning is pure (`Orchestrator.Macho`); IO via a `Macho.Tool`
+  (default `Orchestrator.Macho.Otool`), injectable for tests.
+  """
+  alias Orchestrator.Macho
 
-```bash
-#!/usr/bin/env bash
-# pipeline/bundle-relocate <version> — make build/<version>/Emacs.app self-contained & relocatable.
-# Generic over ALL Mach-O: bundle the non-system dylib closure into Contents/Frameworks, normalize
-# refs to @rpath, give each Mach-O a depth-correct @loader_path rpath, delete the build-time conda
-# rpath, ad-hoc re-sign (Decision C). NO ncurses/terminfo special-case (GUI-only — spec §15).
-set -euo pipefail
-HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-. "$HERE/lib/macho.sh"
-VERSION="${1:-master}"
-BUILD_ROOT="${BUILD_ROOT:-$HERE/build}"
-APP="$BUILD_ROOT/$VERSION/Emacs.app"
-BUILD_LIBDIR="$(cat "$BUILD_ROOT/$VERSION/conda-prefix-lib.txt")"
-[ -d "$APP" ] || { echo "FATAL: $APP missing — run build-emacs first"; exit 1; }
-FW="$APP/Contents/Frameworks"; mkdir -p "$FW"
-APP="$(cd "$APP" && pwd)"; FW="$(cd "$FW" && pwd)"   # canonicalize for relpath
+  @spec run(Path.t(), Path.t(), module) :: :ok | {:error, [Macho.violation()]}
+  def run(app, build_libdir, tool \\ Orchestrator.Macho.Otool) do
+    app = Path.expand(app)
+    fw = Path.join([app, "Contents", "Frameworks"])
+    File.mkdir_p!(fw)
 
-# Resolve a dependency to a real source file in the build env (or empty if not bundleable).
-resolve_src() {
-  case "$(macho_class "$1")" in
-    foreign) printf '%s\n' "$1" ;;                                   # absolute build path → itself
-    bundled) case "$1" in @rpath/*) printf '%s\n' "$BUILD_LIBDIR/${1#@rpath/}" ;; esac ;;
-  esac
-}
-# Deps of $1 that need a copy into Frameworks (foreign-absolute, or @rpath/*).
-bundleable_deps() {
-  local d
-  while IFS= read -r d; do
-    [ -n "$d" ] || continue
-    case "$(macho_class "$d")" in
-      foreign) printf '%s\n' "$d" ;;
-      bundled) case "$d" in @rpath/*) printf '%s\n' "$d" ;; esac ;;
-    esac
-  done < <(macho_deps "$1")
-}
+    copy_closure(machos(app, tool), fw, build_libdir, tool)
+    Enum.each(machos(app, tool), &rewrite(&1, fw, tool))
+    gate(app, fw, tool)
+  end
 
-# 1. BFS the closure into Frameworks.
-# NOTE: stock macOS bash is 3.2 — no associative arrays / array slicing. Use file-based worklist.
-seen="$(mktemp)"; work="$(mktemp)"; trap 'rm -f "$seen" "$work"' EXIT
-while IFS= read -r f; do macho_is_macho "$f" && bundleable_deps "$f"; done < <(find "$APP" -type f) >> "$work"
-while [ -s "$work" ]; do
-  dep="$(head -n1 "$work")"; sed -i '' '1d' "$work"   # pop queue head (BSD sed in-place)
-  base="$(basename "$dep")"
-  grep -qxF "$base" "$seen" && continue
-  printf '%s\n' "$base" >> "$seen"
-  src="$(resolve_src "$dep")"
-  if [ -z "$src" ] || [ ! -e "$src" ]; then echo "WARN: cannot resolve $dep (src='$src')"; continue; fi
-  cp -f "$src" "$FW/$base"; chmod u+w "$FW/$base"
-  macho_set_id "$FW/$base" "@rpath/$base"
-  bundleable_deps "$FW/$base" >> "$work"             # enqueue its deps (transitive closure)
-done
+  defp machos(app, tool) do
+    Path.join(app, "**") |> Path.wildcard() |> Enum.filter(&File.regular?/1) |> Enum.filter(&tool.macho?/1)
+  end
 
-# 2. Rewrite refs + rpaths + re-sign on every Mach-O in the bundle.
-while IFS= read -r f; do
-  macho_is_macho "$f" || continue
-  # 2a. normalize any bundled foreign-absolute dep → @rpath/<base>
-  while IFS= read -r dep; do
-    [ -n "$dep" ] || continue
-    if [ "$(macho_class "$dep")" = foreign ]; then
-      b="$(basename "$dep")"; [ -e "$FW/$b" ] && macho_change "$f" "$dep" "@rpath/$b"
-    fi
-  done < <(macho_deps "$f")
-  # 2b. add depth-correct @loader_path rpath to Frameworks; delete the build-time conda rpath(s)
-  rel="$(macho_relpath "$FW" "$(cd "$(dirname "$f")" && pwd)")"
-  macho_add_rpath "$f" "@loader_path/$rel"
-  while IFS= read -r rp; do
-    [ "$(macho_class "$rp")" = foreign ] && macho_delete_rpath "$f" "$rp"
-  done < <(macho_rpaths "$f")
-  # 2c. ad-hoc re-sign (Decision C — relocation invalidated the signature)
-  macho_resign "$f"
-done < <(find "$APP" -type f)
+  defp copy_closure(machos, fw, lib, tool) do
+    queue = Enum.flat_map(machos, fn f -> Macho.bundleable(tool.deps(f)) end)
+    do_copy(queue, MapSet.new(), fw, lib, tool)
+  end
 
-# 3. The gate.
-macho_gate "$APP"
+  defp do_copy([], _seen, _fw, _lib, _tool), do: :ok
+
+  defp do_copy([dep | rest], seen, fw, lib, tool) do
+    base = Path.basename(dep)
+
+    if MapSet.member?(seen, base) do
+      do_copy(rest, seen, fw, lib, tool)
+    else
+      src = resolve(dep, lib)
+      dest = Path.join(fw, base)
+
+      new_deps =
+        if src && File.exists?(src) do
+          File.cp!(src, dest)
+          File.chmod!(dest, 0o644)
+          tool.set_id(dest, "@rpath/" <> base)
+          Macho.bundleable(tool.deps(dest))
+        else
+          IO.puts(:stderr, "WARN: cannot resolve #{dep} (src=#{inspect(src)})")
+          []
+        end
+
+      do_copy(rest ++ new_deps, MapSet.put(seen, base), fw, lib, tool)
+    end
+  end
+
+  defp resolve("@rpath/" <> base, lib), do: Path.join(lib, base)
+  defp resolve("/" <> _ = abs, _lib), do: abs
+  defp resolve(_, _), do: nil
+
+  defp rewrite(f, fw, tool) do
+    for dep <- tool.deps(f), Macho.classify(dep) == :foreign do
+      base = Path.basename(dep)
+      if File.exists?(Path.join(fw, base)), do: tool.change(f, dep, "@rpath/" <> base)
+    end
+
+    tool.add_rpath(f, "@loader_path/" <> Macho.relpath(fw, Path.dirname(f)))
+    for rp <- tool.rpaths(f), Macho.classify(rp) == :foreign, do: tool.delete_rpath(f, rp)
+    tool.resign(f)
+  end
+
+  defp gate(app, fw, tool) do
+    basenames = case File.ls(fw), do: ({:ok, fs} -> MapSet.new(fs); _ -> MapSet.new())
+    machos = for f <- machos(app, tool), do: %{path: f, deps: tool.deps(f), rpaths: tool.rpaths(f)}
+
+    case Macho.gate_violations(machos, basenames) do
+      [] ->
+        IO.puts("macho_gate: PASS (#{app} self-contained)")
+        :ok
+
+      v ->
+        Enum.each(v, &IO.puts("  VIOLATION #{inspect(&1)}"))
+        IO.puts("macho_gate: FAIL")
+        {:error, v}
+    end
+  end
+end
 ```
 
-- [ ] **Step 4: Run the test to verify it passes**
+> Implementer note: the `case File.ls(fw), do: (...)` one-liner above is illustrative; write it as a normal multi-line `case File.ls(fw) do ... end`. Keep `mix format` clean and `--warnings-as-errors` green.
 
-Run: `bash tests/bundle-relocate_test.sh`
-Expected: PASS — `macho_gate: PASS`, `Emacs ran rc=0`, `helper ran rc=0`, final `bundle-relocate_test: PASS`.
+- [ ] **Step 4: Write the Mix task** — `orchestrator/lib/mix/tasks/relocate.ex`:
 
-- [ ] **Step 5: Commit**
+```elixir
+defmodule Mix.Tasks.Relocate do
+  @shortdoc "Bundle + relocate an Emacs.app into a self-contained bundle (Phase 2)"
+  @moduledoc "Usage: `mix relocate <Emacs.app path> <build libdir>` (the build libdir is `$CONDA_PREFIX/lib`)."
+  use Mix.Task
+
+  @impl true
+  def run([app, build_libdir]) do
+    case Orchestrator.Relocate.run(app, build_libdir) do
+      :ok -> :ok
+      {:error, _violations} -> Mix.raise("relocation gate failed: bundle is not self-contained")
+    end
+  end
+
+  def run(_), do: Mix.raise("usage: mix relocate <Emacs.app path> <build libdir>")
+end
+```
+
+- [ ] **Step 5: Run the integration test to verify it passes**
+Run: `mise exec -- sh -c 'cd orchestrator && mix test test/orchestrator/relocate_test.exs --include macos'`
+Expected: PASS — 1 test, 0 failures (Frameworks has libfoo+libbar; both binaries run rc 0 after the build libdir is moved aside).
+
+- [ ] **Step 6: Full suite + format + commit**
+Run: `mise run test` (note: `:macos` tests are EXCLUDED by default off Darwin; on this macOS host include them: `mise exec -- sh -c 'cd orchestrator && mix test --include macos'`) and `mise run lint`.
+Expected: all green, no warnings, formatted.
 
 ```bash
-git add pipeline/bundle-relocate tests/bundle-relocate_test.sh
-git commit -m "feat(phase2): bundle-relocate — generic Mach-O closure walk + relocation"
+git add orchestrator/lib/orchestrator/relocate.ex orchestrator/lib/mix/tasks/relocate.ex \
+        orchestrator/test/orchestrator/relocate_test.exs
+git commit -m "feat(phase2): Orchestrator.Relocate runner + mix relocate task (generic Mach-O closure walk)"
 ```
 
 ---
 
-## Task 3: `pipeline/build-emacs` — build the relocatable-candidate app
+## Task 3: `pipeline/build-emacs` — build the relocatable-candidate app (bash)
 
 **Files:**
 - Create: `pipeline/build-emacs`
 
-This stage runs a real ~15–20 min build; it has no fast unit test. Its "test" is that it produces a runnable `Emacs.app` and the discovery dump (Step 2). Tasks 1–2 already proved the relocation logic on fixtures.
+A real ~15–20 min build; no fast unit test. Its "test" is that it produces a runnable `Emacs.app` + the discovery dump. The relocation logic is already proven in Tasks 1–2.
 
 - [ ] **Step 1: Write `pipeline/build-emacs`**
 
@@ -374,7 +592,7 @@ This stage runs a real ~15–20 min build; it has no fast unit test. Its "test" 
 #!/usr/bin/env bash
 # pipeline/build-emacs <version> — build a relocatable-CANDIDATE GUI Emacs.app from the per-version
 # pixi env. Output: build/<version>/Emacs.app (still linked to pixi @rpath libs) + conda-prefix-lib.txt
-# + otool-prereloc.txt. bundle-relocate makes it self-contained. native-comp OFF; GUI-only.
+# + otool-prereloc.txt. `mix relocate` makes it self-contained. native-comp OFF; GUI-only.
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 VERSION="${1:-master}"
@@ -397,9 +615,9 @@ echo ">> [2] configure + make + install UNDER the pixi env"
   export PATH="$CONDA_PREFIX/bin:$PATH"
   export PKG_CONFIG="$CONDA_PREFIX/bin/pkg-config" PKG_CONFIG_PATH="$CONDA_PREFIX/lib/pkgconfig"
   ./autogen.sh
-  # -headerpad_max_install_names: room for install_name rewrites in bundle-relocate.
+  # -headerpad_max_install_names: room for install_name rewrites during relocation.
   # -rpath,$CONDA_PREFIX/lib: the in-build DUMP step (temacs --temacs=pbootstrap) must load conda
-  #   @rpath dylibs (Phase-1 finding). bundle-relocate deletes this rpath afterward.
+  #   @rpath dylibs (Phase-1 finding). Relocation deletes this rpath afterward.
   ./configure '"$EMACS_FLAGS"' "LDFLAGS=-Wl,-headerpad_max_install_names -Wl,-rpath,$CONDA_PREFIX/lib"
   make -j"$(sysctl -n hw.ncpu)"
   make install
@@ -420,24 +638,17 @@ sed -i '' "s|$HOME|~|g" "$OUT/otool-prereloc.txt" 2>/dev/null || true
 echo ">> build-emacs: $OUT/Emacs.app ready (run 'mise run relocate' next)"
 ```
 
-- [ ] **Step 2: Build and verify the candidate app exists and runs**
-
+- [ ] **Step 2: Build and verify the candidate exists and runs**
 Run: `bash pipeline/build-emacs master`
-Expected:
-- Completes with `build-emacs: build/master/Emacs.app ready`.
-- `build/master/Emacs.app/Contents/MacOS/Emacs` exists.
-- `build/master/conda-prefix-lib.txt` contains a path ending in `.pixi/envs/default/lib`.
-- `build/master/otool-prereloc.txt` shows the main binary depends on `@rpath/libgnutls.30.dylib`, `@rpath/libxml2.2.dylib`, `@rpath/libtree-sitter.0.26.dylib`, `@rpath/libncurses.6.dylib` (per Phase-1), plus `/usr/lib/*` system libs.
+Expected: `build/master/Emacs.app/Contents/MacOS/Emacs` exists; `build/master/conda-prefix-lib.txt` ends in `.pixi/envs/default/lib`; `otool-prereloc.txt` shows `@rpath/lib{gnutls.30,xml2.2,tree-sitter.0.26,ncurses.6}.dylib` + `/usr/lib/*`.
 
-> **Validation point (ns self-contained):** if `make install` does **not** yield `nextstep/Emacs.app`, capture where it put the app and what the layout is, then adjust the `find` in Step 3 of the script. This is the one ns-build assumption that needs confirming on first run — record the actual layout for Task 7.
+> **Validation point (ns self-contained):** if `make install` does not yield `nextstep/Emacs.app`, capture where it landed and the layout, and adjust the `find` in Step 3. Record the actual layout for Task 7.
 
-- [ ] **Step 3: Sanity-run on the host (still has pixi — confirms the build is valid, not yet the clean proof)**
-
+- [ ] **Step 3: Sanity-run on the host (still has pixi — confirms the build is valid)**
 Run: `build/master/Emacs.app/Contents/MacOS/Emacs --batch --eval '(princ (format "ok %s\n" emacs-version))'`
-Expected: prints `ok 32.0.50` (or current master version).
+Expected: prints `ok 32.0.50` (or current master).
 
 - [ ] **Step 4: Commit**
-
 ```bash
 git add pipeline/build-emacs
 git commit -m "feat(phase2): build-emacs — build a relocatable-candidate GUI Emacs.app from the pixi env"
@@ -447,32 +658,26 @@ git commit -m "feat(phase2): build-emacs — build a relocatable-candidate GUI E
 
 ## Task 4: Relocate the real build + gate green locally
 
-**Files:** none new — runs Task 2's stage on Task 3's output.
+**Files:** none new — runs `mix relocate` on Task 3's output.
 
-- [ ] **Step 1: Run the relocation on the real app**
-
-Run: `bash pipeline/bundle-relocate master`
+- [ ] **Step 1: Relocate the real app**
+Run: `mise run relocate` (i.e. `cd orchestrator && mix relocate ../build/master/Emacs.app "$(cat ../build/master/conda-prefix-lib.txt)"`).
 Expected: ends with `macho_gate: PASS (…/build/master/Emacs.app self-contained)`, exit 0.
 
-- [ ] **Step 2: Independently re-run the gate (idempotent check) and inspect the closure**
-
+- [ ] **Step 2: Independently inspect the closure + rpaths**
 Run:
 ```bash
-source lib/macho.sh && macho_gate build/master/Emacs.app
 ls build/master/Emacs.app/Contents/Frameworks/
 otool -l build/master/Emacs.app/Contents/MacOS/Emacs | awk '/LC_RPATH/{f=1} f&&/path /{print; f=0}'
+otool -L build/master/Emacs.app/Contents/MacOS/Emacs | sed -n '2,$p'
 ```
-Expected:
-- `macho_gate: PASS`.
-- `Frameworks/` contains `libgnutls.30.dylib`, `libxml2.2.dylib`, `libtree-sitter.0.26.dylib`, `libncurses.6.dylib`, and the gnutls transitive closure (`libnettle*`, `libhogweed*`, `libp11-kit*`, `libtasn1*`, `libgmp*`, `libidn2*`, `libunistring*`).
-- The main binary has an rpath `@loader_path/../Frameworks` and **no** `…/.pixi/…` rpath.
+Expected: Frameworks holds `lib{gnutls.30,xml2.2,tree-sitter.0.26,ncurses.6}.dylib` + the gnutls transitive closure (`libnettle*`,`libhogweed*`,`libp11-kit*`,`libtasn1*`,`libgmp*`,`libidn2*`,`libunistring*`); the binary has `@loader_path/../Frameworks` and **no** `.pixi` rpath; no `@rpath` dep is unresolved.
 
-- [ ] **Step 3: Commit (record the validated closure in the message)**
-
+- [ ] **Step 3: Commit (record the validated closure)**
 ```bash
-git commit --allow-empty -m "test(phase2): relocate real master build — macho_gate green, closure bundled
+git commit --allow-empty -m "test(phase2): relocate real master build — gate green, closure bundled
 
-Frameworks closure verified on osx-arm64: gnutls(+nettle/hogweed/p11-kit/tasn1/gmp/idn2/unistring),
+Verified Frameworks closure on osx-arm64: gnutls(+nettle/hogweed/p11-kit/tasn1/gmp/idn2/unistring),
 libxml2, tree-sitter, ncurses. No .pixi refs/rpaths remain."
 ```
 
@@ -531,8 +736,7 @@ SSH 'launchctl asuser $(id -u admin) ~/app/Emacs.app/Contents/MacOS/Emacs -Q \
 echo ">> cleanroom: PASS — self-contained on a clean macOS VM (no pixi)"
 ```
 
-- [ ] **Step 2: Pull a base image once (if not present) and run the proof**
-
+- [ ] **Step 2: Pull a base image once (if needed) and run the proof**
 Run:
 ```bash
 mise exec -- tart list | grep -q macos-sequoia-base || mise exec -- tart pull ghcr.io/cirruslabs/macos-sequoia-base:latest
@@ -540,10 +744,9 @@ bash scripts/cleanroom.sh master
 ```
 Expected: `[4]` prints `ok 32.0.50`; `[5]` prints `GUI frame OK`; final `cleanroom: PASS`.
 
-> **Validation points:** (a) `sshpass` must be installed (`mise exec -- pixi global install sshpass`, or document the host install). (b) If `--no-graphics` prevents the NS GUI session, drop it and rely on the image's auto-login; if `[5]` still can't reach the session over ssh, the `launchctl asuser` wrapper shown is the fallback. (c) `[4]` (`--batch`) is the **hard** DoD gate; record `[5]`'s exact working invocation in Task 7.
+> **Validation points:** (a) `sshpass` must be installed (document the host install). (b) If `--no-graphics` prevents the NS GUI session, drop it; if `[5]` still can't reach the session over ssh, the `launchctl asuser` wrapper is the fallback. (c) `[4]` (`--batch`) is the **hard** DoD gate; record `[5]`'s working invocation in Task 7.
 
 - [ ] **Step 3: Commit**
-
 ```bash
 git add scripts/cleanroom.sh
 git commit -m "feat(phase2): cleanroom.sh — fresh-tart-VM launch proof (no pixi)"
@@ -556,9 +759,7 @@ git commit -m "feat(phase2): cleanroom.sh — fresh-tart-VM launch proof (no pix
 **Files:**
 - Modify: `mise.toml`, `.gitignore`, `.pregate/macos.sh`
 
-- [ ] **Step 1: Add the Phase 2 tasks to `mise.toml`**
-
-Append after the existing `[tasks.configure-check]` block:
+- [ ] **Step 1: Add the Phase 2 tasks to `mise.toml`** (append after `[tasks.configure-check]`):
 
 ```toml
 [tasks.build]
@@ -566,52 +767,44 @@ description = "Phase 2: build a relocatable-candidate GUI Emacs.app from the per
 run = "bash pipeline/build-emacs master"
 
 [tasks.relocate]
-description = "Phase 2: bundle + relocate the built Emacs.app into a self-contained app (macho_gate)"
-run = "bash pipeline/bundle-relocate master"
-
-[tasks.test-macho]
-description = "Phase 2: fixture tests for lib/macho.sh + pipeline/bundle-relocate (macOS host tools)"
-run = "bash tests/macho_test.sh && bash tests/bundle-relocate_test.sh"
+description = "Phase 2: bundle + relocate the built Emacs.app into a self-contained app (Elixir; gate)"
+dir = "orchestrator"
+run = "mix relocate ../build/master/Emacs.app \"$(cat ../build/master/conda-prefix-lib.txt)\""
 
 [tasks.cleanroom]
 description = "Phase 2 DoD: launch the relocated Emacs.app in a fresh tart VM with no pixi"
 run = "bash scripts/cleanroom.sh master"
 ```
 
-- [ ] **Step 2: Ignore the build output**
+(No `test-macho` task — the Macho/Relocate tests run under `mise run test`; the integration test is `@tag :macos`, auto-run on this macOS host, excluded on ubuntu CI.)
 
-Add to `.gitignore`:
-
+- [ ] **Step 2: Ignore the build output** — add to `.gitignore`:
 ```
 # Phase 2 build/relocate output (ephemeral)
 /build/
 ```
 
-- [ ] **Step 3: Extend `.pregate/macos.sh` (static gate only — no nested VM)**
-
-Replace `.pregate/macos.sh` with:
-
+- [ ] **Step 3: Extend `.pregate/macos.sh`** (static gate only — no nested VM):
 ```sh
 #!/bin/sh
-# pregate macos recipe — shared body (orchestrator test+lint) then the Phase 2 build+relocate gate.
-# Runs INSIDE the pregate VM; uses only host tools + pixi (no nested tart). The clean-VM launch
-# (scripts/cleanroom.sh) is a host-side step, not run here.
+# pregate macos recipe — shared body (orchestrator test+lint, incl. the :macos relocation test)
+# then the Phase 2 build+relocate gate. Runs INSIDE the pregate VM; no nested tart. The clean-VM
+# launch (scripts/cleanroom.sh) is a host-side step, not run here.
 . ./.pregate/common.sh
-mise run test-macho
 mise run build
-mise run relocate    # ends with macho_gate — fails the pregate if the bundle isn't self-contained
+mise run relocate    # mix relocate ends with the gate — fails pregate if the bundle isn't self-contained
 ```
 
-- [ ] **Step 4: Verify the fast tasks run**
+> Note: `common.sh` runs `mise run test`, which on this macOS VM includes the `@tag :macos` relocation integration test (Darwin → not excluded). No separate task needed.
 
-Run: `mise run test-macho`
-Expected: both fixture suites print PASS; exit 0.
+- [ ] **Step 4: Verify the fast suite runs**
+Run: `mise run test` (on macOS includes the `:macos` integration test).
+Expected: all green.
 
 - [ ] **Step 5: Commit**
-
 ```bash
 git add mise.toml .gitignore .pregate/macos.sh
-git commit -m "build(phase2): mise tasks (build/relocate/test-macho/cleanroom) + pregate gate + gitignore"
+git commit -m "build(phase2): mise tasks (build/relocate/cleanroom) + pregate gate + gitignore"
 ```
 
 ---
@@ -622,30 +815,24 @@ git commit -m "build(phase2): mise tasks (build/relocate/test-macho/cleanroom) +
 - Modify: `docs/superpowers/validation-log.md`, `docs/superpowers/specs/2026-06-05-bundled-emacs-build-system-design.md`, `versions/master/mise.toml`
 
 - [ ] **Step 1: Append the Phase 2 section to `docs/superpowers/validation-log.md`**
-
-Add a dated section recording: the real Frameworks closure (from Task 4 Step 2); the confirmed ns `make install` app location (from Task 3 Step 2); the exact working `cleanroom` GUI invocation (Task 5); confirmation that `--batch` + GUI run with no pixi; and **Decision E** —
-
+Record: the real Frameworks closure (Task 4 Step 2); the confirmed ns `make install` app location (Task 3 Step 2); the working `cleanroom` GUI invocation (Task 5); confirmation that `--batch` + GUI run with no pixi; the hybrid bash/Elixir split decision; and **Decision E** —
 ```markdown
 ### Decision E — host make/CLT fingerprint gap (spec §8): RESOLVED (record now, wire Phase 5)
-Fold the toolchain identity of the host compiler into `toolchain_hash` when the fingerprint is
-consumed (Phase 5): `xcode-select -p` + `clang --version` (the CLT/SDK build string). A runner-image
-CLT/SDK bump then rebuilds all refs. No Phase-2 code; documented so Phase 5 wires it.
+Fold `xcode-select -p` + `clang --version` (the CLT/SDK build string) into `toolchain_hash` when
+the fingerprint is consumed (Phase 5). A runner-image CLT/SDK bump then rebuilds all refs. No Phase-2 code.
 ```
 
 - [ ] **Step 2: Reconcile the umbrella spec**
-
-- §9: replace the `@executable_path/../Frameworks` sketch with the actual scheme (build-time `-rpath,$CONDA_PREFIX/lib` for the dump; relocate adds depth-correct `@loader_path/<rel>` and deletes the conda rpath; ad-hoc re-sign per Mach-O).
-- §6.2: change the ncurses row from "system `/usr/lib`, not bundled" to "**bundled** generically (GUI-only; the dylib only needs to resolve — terminfo/`-nw` deferred, §15)".
-- §13: move "`--with-ns` Info.plist/extraction" and "`-nw` on system ncurses" open questions to resolved/deferred, pointing at §15.
+- §9: replace the `@executable_path/../Frameworks` sketch with the actual scheme (build-time `-rpath,$CONDA_PREFIX/lib` for the dump; relocation adds depth-correct `@loader_path/<rel>` and deletes the conda rpath; ad-hoc re-sign per Mach-O); note relocation+gate are **Elixir** (`Orchestrator.{Macho,Relocate}` + `mix relocate`), build is bash — consistent with D4/§7.1.
+- §6.2: change the ncurses row to "**bundled** generically (GUI-only; dylib only needs to resolve — terminfo/`-nw` deferred, §15)".
+- §13: move "`--with-ns` Info.plist/extraction" and "`-nw` on system ncurses" to resolved/deferred (→ §15).
 
 - [ ] **Step 3: Fix the stale comment in `versions/master/mise.toml`**
-
-Change the comment `# ncurses intentionally NOT requested → Emacs links system /usr/lib (spec §6.2).`
-to: `# ncurses links from the pixi env (texinfo pulls it); GUI-only v1 bundles it generically in`
-`# bundle-relocate, no terminfo work. emacs -nw is a post-Phase-4 fast-follow (spec §15).`
+Change `# ncurses intentionally NOT requested → Emacs links system /usr/lib (spec §6.2).` to:
+`# ncurses links from the pixi env (texinfo pulls it); GUI-only v1 bundles it generically during`
+`# relocation, no terminfo work. emacs -nw is a post-Phase-4 fast-follow (spec §15).`
 
 - [ ] **Step 4: Commit**
-
 ```bash
 git add docs/superpowers/validation-log.md docs/superpowers/specs/2026-06-05-bundled-emacs-build-system-design.md versions/master/mise.toml
 git commit -m "docs(phase2): record build+relocation findings + Decision E; reconcile spec §6.2/§8/§9/§13"
@@ -655,19 +842,19 @@ git commit -m "docs(phase2): record build+relocation findings + Decision E; reco
 
 ## Phase 2 Definition of Done
 
-- [ ] `mise run test-macho` green (fixture suites for `macho.sh` + `bundle-relocate`).
+- [ ] `mise run test` green incl. the pure `Orchestrator.Macho` tests + (on macOS) the `@tag :macos` `Relocate` integration test; ubuntu CI stays green (`:macos` excluded).
 - [ ] `mise run build` produces `build/master/Emacs.app` that runs `--batch` on the host.
-- [ ] `mise run relocate` ends with `macho_gate: PASS` — zero foreign dep paths, zero foreign rpaths, full @rpath closure in `Frameworks`.
+- [ ] `mise run relocate` ends with `macho_gate: PASS` — zero foreign deps, zero foreign rpaths, full `@rpath` closure in `Frameworks`.
 - [ ] `mise run cleanroom` green: relocated app runs `--batch` (+ GUI frame) in a fresh tart VM with no pixi.
-- [ ] Validation-log Phase 2 section written (closure, ns layout, cleanroom invocation, Decision E); spec §6.2/§8/§9/§13 reconciled; stale `versions/master/mise.toml` comment fixed.
-- [ ] `emacs -nw`/terminfo confirmed **out of scope**, recorded for post-Phase-4 (spec §15).
+- [ ] Validation-log Phase 2 section written; spec §6.2/§8/§9/§13 reconciled; stale `versions/master/mise.toml` comment fixed.
+- [ ] `emacs -nw`/terminfo confirmed out of scope, recorded for post-Phase-4 (spec §15).
 
 ## Self-Review (author)
 
-**Spec coverage (Phase 2 row of §14 + §9):** "self-contained `.app` launches on a clean runner; `otool` gate green" → Tasks 4 (gate) + 5 (clean VM). `build-emacs` (§9.1) → Task 3. `bundle-relocate` generic over all Mach-O (§9.2) → Task 2. `macho.sh` + verify gate (§5, §9.2) → Task 1. Sign-last ad-hoc (§9.3, Decision C) → in `bundle-relocate` Step 2c. pregate clean-room intent (§11.3) → Task 6 (static gate in-VM) + Task 5 (host clean VM), with the nested-virt constraint documented. CLT fingerprint (§8, Decision E) → Task 7. `headerpad` + header-overflow risk (§12) → `build-emacs` LDFLAGS + macho.sh wrappers (`2>/dev/null || true` on rpath ops; gate catches incompleteness).
+**Spec coverage (§14 Phase 2 + §9):** "self-contained `.app` launches on a clean runner; gate green" → Tasks 4 (gate) + 5 (clean VM). build-emacs (§9.1) → Task 3. generic relocation over all Mach-O (§9.2) → `Orchestrator.Relocate` Task 2. the verify gate (§5/§9.2) → `Macho.gate_violations` Task 1. sign-last ad-hoc (§9.3, Decision C) → `rewrite/3` re-sign. pregate clean-room intent (§11.3) → Task 6 (static gate in-VM) + Task 5 (host clean VM), nested-virt constraint documented. CLT fingerprint (§8, Decision E) → Task 7. headerpad + header-overflow risk (§12) → build-emacs LDFLAGS + the gate catches incompleteness. D4/§7.1 (pure core + IO adapter) → `Macho` (pure) + `Macho.Tool`/`Otool` (IO) + `Relocate`.
 
-**Placeholder scan:** no TBD/TODO-as-work; every code step is complete runnable bash. The three "validation points" (ns app location, sshpass/GUI-session, base image) are explicit *confirm-and-adjust* checks with concrete fallbacks, not deferred work — they exist because the global rule forbids asserting unvalidated host behavior as fact.
+**Placeholder scan:** no code placeholders — every module/test is complete. The `case File.ls/1` one-liner in Task 2 Step 3 is flagged to be rewritten multi-line for `mix format`. The three build/VM "validation points" are confirm-and-adjust steps with concrete fallbacks (per the validate-don't-assume rule), not deferred work.
 
-**Type/name consistency:** function names used across files match `lib/macho.sh` definitions (`macho_is_macho`, `macho_class`, `macho_deps`, `macho_rpaths`, `macho_relpath`, `macho_set_id`, `macho_change`, `macho_add_rpath`, `macho_delete_rpath`, `macho_resign`, `macho_gate`). Path contract is consistent: `build-emacs` writes `build/<v>/{Emacs.app,conda-prefix-lib.txt}`; `bundle-relocate` reads exactly those (with `BUILD_ROOT` override for the fixture test); `cleanroom.sh` reads `build/<v>/Emacs.app`.
+**Type/name consistency:** `Orchestrator.Macho` functions (`classify/1`, `relpath/2`, `parse_id/1`, `parse_deps/2`, `parse_rpaths/1`, `bundleable/1`, `gate_violations/2`) are used consistently by `Macho.Otool` and `Relocate`. The `Macho.Tool` behaviour callbacks (`macho?`, `id`, `deps`, `rpaths`, `set_id`, `change`, `add_rpath`, `delete_rpath`, `resign`) match the `Otool` `@impl` set and the `Relocate` call sites. Path contract: build-emacs writes `build/<v>/{Emacs.app,conda-prefix-lib.txt}`; `mix relocate` reads them via the mise task; `cleanroom.sh` reads `build/<v>/Emacs.app`.
 
-**Scope:** single subsystem (build + relocation), no decomposition needed. native-comp, signing-proper, packaging, CI, and `-nw` are explicitly excluded and routed to their phases.
+**Scope:** single subsystem (build + relocation). native-comp, proper signing, packaging, CI, and `-nw` are excluded and routed to their phases.
