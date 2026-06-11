@@ -86,11 +86,11 @@ misemacs/                              # this repo's fresh contents (publishes t
 ├── pipeline/                          # stages — each standalone & fixture-testable
 │   ├── fetch-source
 │   ├── build-emacs
-│   ├── bundle-relocate                # the relocation crux (otool/install_name_tool)
+│   ├── (relocate → orchestrator)      # relocation crux → Elixir Orchestrator.Relocate + `mix relocate` (Phase 2; not bash)
 │   ├── sign
 │   └── package
 ├── lib/
-│   ├── macho.sh                       # otool/install_name_tool helpers + verify gate
+│   ├── (macho → orchestrator)         # Mach-O helpers + gate → Elixir Orchestrator.Macho (Phase 2; bash macho.sh removed)
 │   └── naming.*                       # SOLE owner of tag/asset/latest name strings
 ├── mise.toml                          # repo-level: pipeline toolchain (pixi, elixir, plugins)
 └── .github/workflows/daily.yml        # cron → decide → dynamic matrix → finalize
@@ -384,7 +384,7 @@ run *by construction* (identical tasks), caught **before** pushing:
 | Risk | Mitigation |
 |---|---|
 | Ad-hoc `.app` blocked on other Macs (Gatekeeper/quarantine) | **Assumed OK** — existing `djgoku/misemacs` releases already install on other Macs; *optionally* double-validate on a 2nd Mac in Phase 3; Developer ID is the fallback (§13) |
-| Mach-O header overflow on relink | `-Wl,-headerpad_max_install_names`; `macho.sh` verifies with `otool -l` and fails loudly |
+| Mach-O header overflow on relink | `-Wl,-headerpad_max_install_names`; the `Orchestrator.Macho` gate verifies via `otool` and fails loudly |
 | Incomplete dylib closure (breaks only on clean machine) | Transitive walk; `otool` gate asserts zero non-system refs; smoke-launch on a clean runner — and locally in a clean macOS VM via **pregate** before CI (§11.3) |
 | Naming drift vs. aqua registry | `lib/naming` is sole owner + contract test against the registry template |
 | `tree-sitter`/`coreutils` registry traps (CLI vs lib) | Sourced from conda-forge as the *library*; `--with-tree-sitter` is v1-optional/droppable (§6.2) |
@@ -427,8 +427,8 @@ Cheap/risky things proven before macOS minutes are spent.
 | Phase | Ships | "Done" = validated by |
 |---|---|---|
 | **0 Skeleton & contracts** (free) | manifest model + `lib/naming`; Elixir `Core.{Hash,Detect,Tag,Decide,Latest}` | unit tests on fixtures: names match aqua template verbatim; "no change ⇒ no release"; `.N` collisions; first-run base case. Also confirm the mise pixi plugins install + the `pixi:<tool>` prefix + whether `pixi:<tool>`/`pixi.lock` lock transitively |
-| **1 Reproducible deps** (local) | per-version pixi PROJECT (`pixi.toml`/`pixi.lock`) via `mise-env-pixi`; `configure`-only run | all deps resolve on osx-arm64 (esp. gnutls closure); **decide tree-sitter in/out** (drop if libtree-sitter isn't clean); configure detects ns/json/xml2/gnutls (+tree-sitter if kept), native-comp off; built Emacs runs `-nw` on system ncurses; direct-`pixi` fallback verified |
-| **2 Build + relocation** (crux) | `build-emacs` + generic `bundle-relocate` + `macho.sh` gate | self-contained `.app` launches on a **clean** runner (no pixi); `otool` gate green |
+| **1 Reproducible deps** (local) | per-version pixi PROJECT (`pixi.toml`/`pixi.lock`) via `mise-env-pixi`; `configure`-only run | all deps resolve on osx-arm64 (esp. gnutls closure); **decide tree-sitter in/out** (drop if libtree-sitter isn't clean); configure detects ns/json/xml2/gnutls (+tree-sitter if kept), native-comp off; built Emacs runs `-nw` (throwaway build; ncurses links from pixi → bundled in Phase 2, GUI-only, `-nw` deferred §15); direct-`pixi` fallback verified |
+| **2 Build + relocation** (crux) | bash `build-emacs` + Elixir `Orchestrator.Relocate`/`mix relocate` + `Macho` gate | self-contained `.app` launches with the pixi env moved aside / on a **clean** pregate VM; gate green |
 | **3 Signing** | ad-hoc sign-last | **assumed good** (existing `djgoku/misemacs` releases install on other Macs); *optionally* double-validate on a 2nd Mac; Developer ID only if it fails |
 | **4 Package + publish** | `package` to exact aqua layout + `SHASUMS256.txt`; `publish` (tag/`.N`/latest/manifest) | `mise use aqua:djgoku/misemacs@<tag>` installs & runs end-to-end on a clean box |
 | **5 Automate** | decide-gate + daily cron + dynamic matrix + PR dry-run + force-build | run twice/day → 2nd skips; forced change → only that ref; partial-failure releases good cells |
