@@ -518,6 +518,14 @@ git commit -m "feat(phase4): mix release.manifest — schema-1 state manifest vi
 
 ## Task 5: `pipeline/package` + mise task + pregate step
 
+> **Review deviation (2026-06-12):** the as-committed `pipeline/package` differs from the
+> script block below in two reviewed fixes: step [6] greps a listing FILE instead of piping
+> `echo "$listing" | grep -q` (pipefail+SIGPIPE made verdicts tar-entry-order-dependent —
+> proven false-FATAL/missed-detection on the real 413KB listing), and the step-[4] `cp -Rp`
+> fallback now `rm -rf`s the partial clone dest first (nesting hazard) without discarding
+> stderr. Plus: CHECKSUMS in the parse guard, EXIT trap for the extract tmpdir, anchored
+> `/dist/` in .gitignore, `--upstream-sha` in the task description.
+
 **Files:**
 - Create: `pipeline/package`
 - Modify: `mise.toml` (add `[tasks.package]`), `.gitignore` (add `dist/`), `.pregate/macos.sh` (append sentinel package run)

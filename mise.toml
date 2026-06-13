@@ -38,7 +38,7 @@ dir = "orchestrator"
 run = "mix relocate ../build/master/Emacs.app \"$(cat ../build/master/conda-prefix-lib.txt)\""
 
 [tasks.package]
-description = "Phase 4: package build/<v>/Emacs.app into dist/<v>/ (xattr-free tar + SHASUMS256.txt + self-verify); args: <version> <tag>"
+description = "Phase 4: package build/<v>/Emacs.app into dist/<v>/ (xattr-free tar + SHASUMS256.txt + self-verify); args: <version> <tag> [--upstream-sha <sha>]"
 run = "bash pipeline/package"
 
 # Phase 2 no-pixi proof: move the per-version pixi env aside, then launch the relocated app. If the

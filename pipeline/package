@@ -29,7 +29,7 @@ while IFS= read -r line; do
     bin=*)       BINS+=("${line#bin=}") ;;
   esac
 done < <(cd "$HERE/orchestrator" && mise exec -- mix release.names --tag "$TAG" --os macos --arch arm64)
-[ -n "$ASSET" ] && [ -n "$STEM" ] && [ "${#BINS[@]}" -ge 4 ] || { echo "FATAL: release.names output incomplete"; exit 1; }
+[ -n "$ASSET" ] && [ -n "$STEM" ] && [ -n "$CHECKSUMS" ] && [ "${#BINS[@]}" -ge 4 ] || { echo "FATAL: release.names output incomplete"; exit 1; }
 
 echo ">> [2] layout check (spec §10; check-only, the bundle is sealed)"
 for bin in "${BINS[@]}"; do
@@ -44,28 +44,31 @@ fi
 
 echo ">> [4] stage + xattr-free tar (E7 / spec §10)"
 rm -rf "$DIST"; mkdir -p "$DIST/stage/$STEM"
-cp -Rc "$APP" "$DIST/stage/$STEM/Emacs.app" 2>/dev/null || cp -Rp "$APP" "$DIST/stage/$STEM/Emacs.app"
+cp -Rc "$APP" "$DIST/stage/$STEM/Emacs.app" 2>/dev/null \
+  || { rm -rf "$DIST/stage/$STEM/Emacs.app"; cp -Rp "$APP" "$DIST/stage/$STEM/Emacs.app"; }
 (cd "$DIST/stage" && COPYFILE_DISABLE=1 tar --no-xattrs -czf "../$ASSET" "$STEM")
 
 echo ">> [5] checksums ($CHECKSUMS, bare-basename entries)"
 (cd "$DIST" && shasum -a 256 "$ASSET" > "$CHECKSUMS" && shasum -c "$CHECKSUMS")
 
 echo ">> [6] self-verify: tar listing"
-listing="$(tar -tzf "$DIST/$ASSET")"
-echo "$listing" | grep -qv "^$STEM/" && { echo "FATAL: entry outside stem dir"; exit 1; }
+tar -tzf "$DIST/$ASSET" > "$DIST/stage/listing.txt"
+bad="$(grep -v "^$STEM/" "$DIST/stage/listing.txt" || true)"
+[ -z "$bad" ] || { echo "FATAL: entry outside stem dir: $(echo "$bad" | head -1)"; exit 1; }
 for bin in "${BINS[@]}"; do
-  echo "$listing" | grep -qx "$STEM/$bin" || { echo "FATAL: $bin missing from tarball"; exit 1; }
+  grep -qxF "$STEM/$bin" "$DIST/stage/listing.txt" || { echo "FATAL: $bin missing from tarball"; exit 1; }
 done
 
 echo ">> [7] self-verify: extract transport smoke (E7-correct checks)"
 T="$(mktemp -d)"
+trap 'rm -rf "$T"' EXIT
 tar -xzf "$DIST/$ASSET" -C "$T"
 "$T/$STEM/Emacs.app/Contents/MacOS/Emacs" --batch --eval '(princ (format "ok %s\n" emacs-version))'
 codesign --verify --strict "$T/$STEM/Emacs.app/Contents/Frameworks/libgnutls.30.dylib"
 codesign --verify --strict "$T/$STEM/Emacs.app/Contents/MacOS/bin/emacsclient"
 xcount="$(find "$T" -exec xattr -l {} + 2>/dev/null | grep -c -E 'com\.apple\.(quarantine|cs\.)' || true)"
 [ "$xcount" = "0" ] || { echo "FATAL: $xcount signature/quarantine xattrs survived the tar"; exit 1; }
-rm -rf "$T" "$DIST/stage"
+rm -rf "$DIST/stage"
 
 printf '%s\n' "$UPSTREAM_SHA" > "$DIST/upstream-sha.txt"
 echo ">> package: PASS — $DIST/$ASSET + $CHECKSUMS (upstream $UPSTREAM_SHA)"
