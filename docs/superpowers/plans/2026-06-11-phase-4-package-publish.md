@@ -662,6 +662,14 @@ git commit -m "feat(phase4): pipeline/package — layout check, xattr-free tar, 
 
 ## Task 6: `pipeline/publish` + `pipeline/promote` + mise tasks
 
+> **Review deviation (2026-06-13):** as-committed `pipeline/publish` materializes the tag
+> snapshot via `snap="$(snapshot)"` (command substitution) before feeding `release.names`,
+> instead of `snapshot | … mix release.names` directly in the process substitution — proc-sub
+> failure is invisible to `set -e`, so a failed `git ls-remote` (partial snapshot) could let
+> `gh release create` silently adopt a dangling tag (P2) and ship a wrong-commit release. The
+> publish completeness guard also checks ASSET+CHECKSUMS, and `pipeline/promote` cross-checks
+> the `--tag` against the packaged `dist/<version>/<asset>` before writing the manifest.
+
 **Files:**
 - Create: `pipeline/publish`, `pipeline/promote`
 - Modify: `mise.toml`

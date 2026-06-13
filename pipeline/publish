@@ -31,6 +31,12 @@ snapshot() {  # union of git tags (complete; strips peeled ^{} dups) and release
 
 for attempt in 1 2 3; do
   echo ">> [attempt $attempt] tag snapshot + names (snapshot mode)"
+  # Materialize the snapshot via command substitution FIRST: under set -e+pipefail a failed
+  # git ls-remote / gh release list aborts HERE (loudly). Done inside a process substitution
+  # instead, that failure is invisible to set -e and yields a PARTIAL snapshot — which could
+  # drop a dangling tag and let `gh release create` silently ADOPT it (P2) rather than collide
+  # (P1), attaching assets to a wrong commit. (review fix)
+  snap="$(snapshot)"
   TAG=""; ASSET=""; CHECKSUMS=""
   while IFS= read -r line; do
     case "$line" in
@@ -38,9 +44,9 @@ for attempt in 1 2 3; do
       asset=*)     ASSET="${line#asset=}" ;;
       checksums=*) CHECKSUMS="${line#checksums=}" ;;
     esac
-  done < <(snapshot | (cd "$HERE/orchestrator" && mise exec -- mix release.names \
+  done < <(printf '%s\n' "$snap" | (cd "$HERE/orchestrator" && mise exec -- mix release.names \
              --channel "$CHANNEL" --date "$DATE" --os macos --arch arm64 --tags-file -))
-  [ -n "$TAG" ] || { echo "FATAL: release.names produced no tag"; exit 1; }
+  [ -n "$TAG" ] && [ -n "$ASSET" ] && [ -n "$CHECKSUMS" ] || { echo "FATAL: release.names output incomplete"; exit 1; }
 
   echo ">> package $VERSION as $TAG"
   bash "$HERE/pipeline/package" "$VERSION" "$TAG"

@@ -21,6 +21,13 @@ fi
 SHA_FILE="$HERE/dist/$VERSION/upstream-sha.txt"
 [ -f "$SHA_FILE" ] || { echo "FATAL: $SHA_FILE missing — run pipeline/package (or publish) first"; exit 1; }
 
+ASSET=""
+while IFS= read -r line; do
+  case "$line" in asset=*) ASSET="${line#asset=}" ;; esac
+done < <(cd "$HERE/orchestrator" && mise exec -- mix release.names --tag "$TAG" --os macos --arch arm64)
+[ -n "$ASSET" ] && [ -f "$HERE/dist/$VERSION/$ASSET" ] || {
+  echo "FATAL: $HERE/dist/$VERSION/$ASSET missing — does --tag match the packaged dist/ artifact?"; exit 1; }
+
 echo ">> [1] build-manifest.json via mix release.manifest (Core.Hash fingerprint)"
 (cd "$HERE/orchestrator" && mise exec -- mix release.manifest \
   --version "$VERSION" --tag "$TAG" --upstream-sha "$(cat "$SHA_FILE")" \
