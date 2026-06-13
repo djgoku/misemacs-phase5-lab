@@ -22,20 +22,23 @@ CHANNEL="${CHANNEL:-$VERSION}"   # v1: channel == version name for master (Manif
 DATE="$(date -u +%F)"
 
 snapshot() {  # union of git tags (complete; strips peeled ^{} dups) and release names (draft-held names, P4)
-  {
-    git ls-remote --tags "https://github.com/$REPO" | awk '{print $2}' \
-      | sed -e 's|^refs/tags/||' -e 's|\^{}$||'
-    gh release list --repo "$REPO" --limit 1000 --json tagName --jq '.[].tagName'
-  } | sort -u
+  # Each source is its OWN command-substitution assignment so set -e+pipefail HONORS a failure:
+  # inside a `{ a; b; } | sort` group a non-final failure (a failed `git ls-remote`) is MASKED —
+  # the group's status is its LAST command (gh), so a partial snapshot would slip through (proven
+  # on bash 3.2). A partial snapshot can drop a dangling tag and let `gh release create` silently
+  # ADOPT it (P2) instead of colliding (P1), attaching assets to a wrong commit. Per-source
+  # assignments make any source failure abort publish loudly. (review fix)
+  local _tags _releases
+  _tags="$(git ls-remote --tags "https://github.com/$REPO" | awk '{print $2}' \
+            | sed -e 's|^refs/tags/||' -e 's|\^{}$||')"
+  _releases="$(gh release list --repo "$REPO" --limit 1000 --json tagName --jq '.[].tagName')"
+  printf '%s\n%s\n' "$_tags" "$_releases" | sort -u
 }
 
 for attempt in 1 2 3; do
   echo ">> [attempt $attempt] tag snapshot + names (snapshot mode)"
-  # Materialize the snapshot via command substitution FIRST: under set -e+pipefail a failed
-  # git ls-remote / gh release list aborts HERE (loudly). Done inside a process substitution
-  # instead, that failure is invisible to set -e and yields a PARTIAL snapshot — which could
-  # drop a dangling tag and let `gh release create` silently ADOPT it (P2) rather than collide
-  # (P1), attaching assets to a wrong commit. (review fix)
+  # snapshot() aborts loudly if either source fails (see its comment); cmd-sub here propagates
+  # that. A clean partial snapshot is therefore impossible — no silent P2 dangling-tag adoption.
   snap="$(snapshot)"
   TAG=""; ASSET=""; CHECKSUMS=""
   while IFS= read -r line; do

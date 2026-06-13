@@ -945,8 +945,15 @@ gh release view "$(gh release list --repo djgoku/misemacs-phase4-lab --limit 1 -
 gh api repos/djgoku/misemacs-phase4-lab/releases/latest --jq .tag_name 2>&1 || echo "no latest yet — correct (--latest=false on the only release)"
 ```
 
-Expected: `publish: PASS — emacs-master-<today> …`; assets = the ~150 MB tarball + `SHASUMS256.txt`; and **no Latest release exists** (GitHub returns 404 for `releases/latest` when the repo's only release was created `--latest=false`) — that proves G1.
+Expected: `publish: PASS — emacs-master-<today> …`; assets = the ~150 MB tarball + `SHASUMS256.txt`.
 Record `LAB_TAG=emacs-master-<today>` for the next steps.
+
+> **Superseded (see validation log §2, 2026-06-13):** this step originally expected
+> `releases/latest` → 404 "proves G1". That expectation was WRONG — `GET /releases/latest`
+> falls back to the most-recent published release when *none* is flagged `make_latest`, so the
+> sole `--latest=false` release IS returned. The real G1 property is **incumbent preservation**
+> (a newer `--latest=false` release does not steal an existing flagged latest), confirmed live
+> on the lab and on the real repo (`@latest` stayed `emacs-master-2026.06.05` throughout Task 10).
 
 - [ ] **Step 4: VM E2E against the lab (~25 min: VM boot + 150 MB download + checks)**
 

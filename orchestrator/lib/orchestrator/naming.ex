@@ -2,8 +2,10 @@ defmodule Orchestrator.Naming do
   @moduledoc """
   SOLE owner of release tag / asset / checksum name strings.
 
-  These MUST match the aqua registry template
-  (djgoku/aqua-registry@feat/djgoku/misemacs):
+  These MUST match the consumed aqua registry template — the vendored
+  `aqua/registry.yaml` in this repo, bound here by `registry_contract_test.exs`
+  (Phase 4, P7/G5; the `djgoku/aqua-registry@feat/...` branch is a PR-shaped copy,
+  not the file `MISE_AQUA_REGISTRY_URL` serves):
 
       misemacs-{{.Version}}-{{.OS}}-{{.Arch}}.tar.gz   (darwin -> macos, format tar.gz)
 
