@@ -408,3 +408,73 @@ produced **zero** clone truncation or false failure (all clones ran intact;
 build-from-source completed). Empirical evidence the byte-count caution is
 over-conservative when guest writes are flushed (pregate already `sync`s); the
 KB note is being relaxed accordingly.
+
+## 2026-06-14 — Phase 5 (automate): implementation + throwaway validation
+
+Spec `docs/superpowers/specs/2026-06-13-phase-5-automate-design.md`, plan
+`…/plans/2026-06-13-phase-5-automate.md`. Implemented via subagent-driven
+development (Tasks 1–12) on branch `phase-5-automate`; full DoD validated on the
+public throwaway `djgoku/misemacs-phase5-lab` (deleted post-cutover). The real
+repo was never touched.
+
+### 1. Implementation — 13 commits, 104 ExUnit green
+New Elixir behind behaviours: `Toolchain`(+Macos CLT/SDK fingerprint, Decision E),
+`Upstream`(+GitLsRemote), `Releases`(+Gh); pure `Orchestrate.{decide,finalize}_outputs`;
+`mix orchestrate.{decide,finalize}`; `Hash.toolchain_hash/3`; `Manifest.versions!/merge`;
+`Decide.force/3`; `release.manifest --clt-fingerprint`. Bash: `publish` writes
+`published-tag.txt`; `promote --manifest`. `targets.toml` runner=`macos-26`; mise tasks
+`decide`/`finalize`; `.github/workflows/daily.yml` (decide→build→finalize).
+- Per-task (combined spec+quality) reviews + a final whole-branch opus review.
+- **Decision-E invariant EMPIRICALLY PROVEN**: `mix orchestrate.decide` (detect) and
+  `mix release.manifest` compute a **bit-identical `inputs_hash`** over the same root/clt/sha
+  (ran both paths; `sha256:8238032d…`) ⇒ no daily rebuild-storm.
+- Review caught a real bug: `System.cmd` **raises** `ErlangError(:enoent)` on a missing
+  binary — a `case … _ -> nil` only catches a nonzero *exit*, not the raise. Added
+  `rescue ErlangError` to the `Releases.Gh`/`Upstream.GitLsRemote` adapters (commit `8f5eec0`)
+  so an absent `gh`/`git` degrades to `nil` (the self-heal contract) instead of crashing.
+
+### 2. Five CI bugs found by the throwaway BEFORE the real repo (each ~2-min fast-fail)
+1. **`jdx/mise-action@v2`** constructs an outdated mise download URL → 404 → bumped to **@v4**
+   (and all actions to latest majors: checkout v6, cache v5, upload-artifact v7, download-artifact v8).
+2. **mise `2026.6.7` shipped ZERO macos-arm64 assets** (a broken release; `2026.6.6` has the full set)
+   → pin `version: 2026.6.6` in mise-action. (→ KB)
+3. **mise-action@v4 auto-runs `mise install --locked`** when a `mise.lock` is present, which
+   **aborts** because `core:erlang` is source-compiled and has no lockfile URL. Fix: `install: false`
+   + a plain `mise install` step (what `@v2` did). The action's `shouldUseLockedInstall()` only
+   skips `--locked` when `tool_versions`/`mise_toml` is set or no lock file exists — there is no
+   "disable locked" input. (→ KB mise.md)
+4. **daily.yml jobs run `mix` tasks without `mix deps.get`** (unlike the `test` task) → fresh
+   runners hit "unchecked dependencies". Fix: a per-job setup step `mise install` + `mix deps.get`.
+5. **The `decide` step piped `mise run decide` straight into `$GITHUB_OUTPUT`** via `tee`; the
+   first-run **`mix compile` noise** (the toml dep's Elixir-1.20 type warnings, "Compiling N files")
+   went into the output file → `##[error]…Value cannot be null (name)`. Fix: capture to a temp file,
+   `grep -E '^(matrix|any|dry_run)='` → `$GITHUB_OUTPUT` (finalize/dry-run paths already use `sed -n '/p'`).
+
+### 3. T1–T10 + consumer DoD — all PASS on real macos-26 runners
+- **T6/T1/T2/T5/T10 + full pipeline** (run 27502509167): first_run → `decide` emits the matrix on
+  macos-26 → `build` (build/relocate/sign/package/publish) → `finalize` merge + flip. First release
+  `emacs-master-2026-06-14` is **Latest** with `…-macos-arm64.tar.gz` (63 MB) + `SHASUMS256.txt` +
+  `build-manifest.json` (`inputs_hash sha256:d10171…`, `upstream_sha ca44dce1`, `released_tag`).
+- **T9 idempotency (§14 DoD)**: 2nd same-day run → `matrix={"include":[]}`, `any=false` → build +
+  finalize **skipped**, release count unchanged.
+- **Consumer install (§14 DoD)** — fresh macOS VM, `mise use aqua:djgoku/misemacs-phase5-lab@<tag>`:
+  download/checksum/extract → `E2E-BATCH-OK 32.0.50`, GUI, `E2E-EMBEDDED-SIGS-OK`, `E2E-NO-QUARANTINE`,
+  `e2e: PASS` (101 s).
+- **T8 force**: 2 dispatches → `.1`/`.2` (real same-day `.N` collision). **T8 dry-run** (PR touching
+  `versions/master/mise.toml`): build → `dryrun-master-macos-arm64` 62 MB artifact, **finalize skipped,
+  NO release** (count stayed at .1/.2).
+- **T3 concurrency**: two same-cell force builds **serialized** by `concurrency: build-master-macos-arm64`
+  (cancel-in-progress:false) — B ran 16:33:52–16:41:02, then A 16:41:05–16:48:07 (3 s after B; zero overlap).
+- **T4 schedule**: a `schedule` tick fired from the default branch (17:03 from a 16:39 cron, GitHub
+  cron lag ~24 min) → detect mode → `any=false` → skip. Confirms cron-from-default-branch (the
+  cutover-last activation).
+- **T7 caches**: cold first build, then **~6-min warm builds** (mise-action tool cache for
+  erlang/elixir/pixi + the `pixi-env` `actions/cache`). Build perf far better than the ~40-min estimate.
+
+### Phase-5 status
+Implementation + the entire T1–T10 + consumer DoD are validated. The CI fixes above (and a
+`build(orchestrator)` switch of the `toml` dep to `github:bitwalker/toml-elixir@e32c899` — locally
+green but lab-validated on hex `0.7.0`, and that ref does NOT clear the type warnings) are on the
+branch. Remaining = the user's: a signed cutover push of `phase-5-automate` → `djgoku/misemacs` `main`
+(cron activates by construction), then delete the lab. A few branch commits are unsigned (re-signed at
+the cutover squash/merge).
