@@ -1,7 +1,7 @@
 name: daily
 on:
   schedule:
-    - cron: '0 7 * * *'        # daily; activated by the cutover push to main (A10)
+    - cron: '39 16 * * *'        # daily; activated by the cutover push to main (A10)
   workflow_dispatch:
     inputs:
       force_version:
