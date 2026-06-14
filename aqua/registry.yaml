@@ -2,7 +2,7 @@
 packages:
   - type: github_release
     repo_owner: djgoku
-    repo_name: misemacs
+    repo_name: misemacs-phase5-lab
     description: Hermetically-built relocatable Emacs.app for macOS, via mise + conda-forge
     asset: misemacs-{{.Version}}-{{.OS}}-{{.Arch}}.tar.gz
     format: tar.gz
