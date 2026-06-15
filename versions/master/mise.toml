@@ -10,3 +10,4 @@ EMACS_CONFIGURE_FLAGS = "--with-ns --without-native-compilation --with-tree-sitt
 # Activate the locked pixi build env (mise-env-pixi plugin): puts pkg-config / autoconf /
 # automake / makeinfo on PATH and exposes the gnutls/libxml2/tree-sitter libs+headers.
 _.pixi-env = { tools = true, manifest_path = "./pixi.toml" }
+# T8 dry-run smoke
