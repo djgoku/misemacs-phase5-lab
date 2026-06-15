@@ -25,8 +25,8 @@ dir = "orchestrator"
 run = "mix format"
 
 [tasks.configure-check]
-description = "Phase 1: fetch Emacs + ./configure against the per-version pixi env; assert feature detection (configure-only)"
-run = "bash scripts/configure-check.sh master"
+description = "Phase 1: fetch Emacs + ./configure against the per-version pixi env; assert feature detection (configure-only); args: [version] (default master)"
+run = "bash scripts/configure-check.sh"
 
 [tasks.build]
 description = "Phase 2: build a relocatable-candidate GUI Emacs.app from the per-version pixi env; args: [version] (default master)"
