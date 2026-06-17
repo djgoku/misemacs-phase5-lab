@@ -96,15 +96,20 @@ defmodule Orchestrator.ManifestTest do
 
   test "merge/2 with nil prior starts from the fragments (first run)" do
     frag = %{"schema" => 1, "versions" => %{"master" => %{"released_tag" => "t1"}}}
+
     assert Manifest.merge(nil, [frag]) ==
              %{"schema" => 1, "versions" => %{"master" => %{"released_tag" => "t1"}}}
   end
 
   test "merge/2 adds new version entries to the prior, fragments winning" do
-    prior = %{"schema" => 1, "versions" => %{
-      "master" => %{"released_tag" => "old"},
-      "emacs-30.2" => %{"released_tag" => "keep"}
-    }}
+    prior = %{
+      "schema" => 1,
+      "versions" => %{
+        "master" => %{"released_tag" => "old"},
+        "emacs-30.2" => %{"released_tag" => "keep"}
+      }
+    }
+
     merged = Manifest.merge(prior, [%{"versions" => %{"master" => %{"released_tag" => "new"}}}])
     assert merged["versions"]["master"]["released_tag"] == "new"
     assert merged["versions"]["emacs-30.2"]["released_tag"] == "keep"

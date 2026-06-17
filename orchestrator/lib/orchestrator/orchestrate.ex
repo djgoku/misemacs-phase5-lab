@@ -11,7 +11,15 @@ defmodule Orchestrator.Orchestrate do
   @type outputs :: %{matrix: %{String.t() => [map()]}, any: boolean(), dry_run: boolean()}
 
   @doc "Shape the decide job outputs for a mode. `states`/`manifest` are used only in `detect`."
-  @spec decide_outputs(String.t(), [map()], [map()], map(), map() | nil, String.t(), String.t() | nil) :: outputs()
+  @spec decide_outputs(
+          String.t(),
+          [map()],
+          [map()],
+          map(),
+          map() | nil,
+          String.t(),
+          String.t() | nil
+        ) :: outputs()
   def decide_outputs(mode, versions, jobs, states, manifest, date, force_version) do
     plan =
       case mode do
@@ -27,13 +35,17 @@ defmodule Orchestrator.Orchestrate do
   defp all(versions, date) do
     %Plan{
       date: date,
-      build: Enum.map(versions, &%{name: &1.name, channel: &1.channel, reason: :dry_run, state: %{}}),
+      build:
+        Enum.map(versions, &%{name: &1.name, channel: &1.channel, reason: :dry_run, state: %{}}),
       skip: []
     }
   end
 
   @doc "Merge fragments into prior + pick the latest tag (spec §4.4). `built_tags` oldest→newest."
-  @spec finalize_outputs(map() | nil, [map()], [String.t()]) :: %{manifest: map(), latest_tag: String.t() | nil}
+  @spec finalize_outputs(map() | nil, [map()], [String.t()]) :: %{
+          manifest: map(),
+          latest_tag: String.t() | nil
+        }
   def finalize_outputs(prior, fragments, built_tags) do
     latest =
       case Latest.latest_target(built_tags) do

@@ -3,7 +3,17 @@ defmodule Orchestrator.OrchestrateTest do
   alias Orchestrator.Orchestrate
 
   @versions [%{name: "master", channel: "master", ref: "master"}]
-  @jobs [%{name: "master", channel: "master", ref: "master", target: "macos-arm64", os: "macos", arch: "arm64", runner: "macos-26"}]
+  @jobs [
+    %{
+      name: "master",
+      channel: "master",
+      ref: "master",
+      target: "macos-arm64",
+      os: "macos",
+      arch: "arm64",
+      runner: "macos-26"
+    }
+  ]
 
   test "detect: first run builds, any=true, dry_run=false" do
     states = %{"master" => %{upstream_sha: "a", inputs_hash: "h"}}
@@ -16,7 +26,10 @@ defmodule Orchestrator.OrchestrateTest do
   test "detect: unchanged => empty matrix, any=false (the gate)" do
     states = %{"master" => %{upstream_sha: "a", inputs_hash: "h"}}
     manifest = %{"versions" => %{"master" => %{"upstream_sha" => "a", "inputs_hash" => "h"}}}
-    out = Orchestrate.decide_outputs("detect", @versions, @jobs, states, manifest, "2026-06-13", nil)
+
+    out =
+      Orchestrate.decide_outputs("detect", @versions, @jobs, states, manifest, "2026-06-13", nil)
+
     assert out.matrix == %{"include" => []}
     assert out.any == false
   end

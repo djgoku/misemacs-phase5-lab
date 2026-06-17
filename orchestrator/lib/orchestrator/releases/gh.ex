@@ -23,7 +23,18 @@ defmodule Orchestrator.Releases.Gh do
   end
 
   defp recent_tags(repo) do
-    case gh(["release", "list", "--repo", repo, "--limit", "#{@scan}", "--json", "tagName", "--jq", ".[].tagName"]) do
+    case gh([
+           "release",
+           "list",
+           "--repo",
+           repo,
+           "--limit",
+           "#{@scan}",
+           "--json",
+           "tagName",
+           "--jq",
+           ".[].tagName"
+         ]) do
       {out, 0} -> out |> String.split("\n", trim: true) |> Enum.map(&String.trim/1)
       _ -> []
     end

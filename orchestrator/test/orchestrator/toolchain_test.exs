@@ -23,9 +23,15 @@ defmodule Orchestrator.Toolchain.MacosTest do
 
   test "normalize/3 flips on a clang-build, SDK, or developer-dir change" do
     base = Macos.normalize("/p", "Apple clang version 21.0.0 (clang-2100.1.1.101)\n", "26.5")
-    assert base != Macos.normalize("/p", "Apple clang version 21.0.0 (clang-2100.1.1.102)\n", "26.5")
-    assert base != Macos.normalize("/p", "Apple clang version 21.0.0 (clang-2100.1.1.101)\n", "26.6")
-    assert base != Macos.normalize("/q", "Apple clang version 21.0.0 (clang-2100.1.1.101)\n", "26.5")
+
+    assert base !=
+             Macos.normalize("/p", "Apple clang version 21.0.0 (clang-2100.1.1.102)\n", "26.5")
+
+    assert base !=
+             Macos.normalize("/p", "Apple clang version 21.0.0 (clang-2100.1.1.101)\n", "26.6")
+
+    assert base !=
+             Macos.normalize("/q", "Apple clang version 21.0.0 (clang-2100.1.1.101)\n", "26.5")
   end
 
   @tag :macos
