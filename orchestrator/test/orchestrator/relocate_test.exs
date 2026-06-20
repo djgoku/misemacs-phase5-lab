@@ -241,4 +241,127 @@ defmodule Orchestrator.RelocateTest do
     assert {:error, violations} = Orchestrator.Relocate.run(app, lib)
     assert Enum.any?(violations, &match?({:missing_lib, _, "@rpath/libmissing.dylib"}, &1))
   end
+
+  test "relocate seeds enchant providers, bundles libenchant + SDK, provider dlopens with build libdir gone",
+       %{t: t} do
+    lib = Path.join(t, "buildlib")
+    app = Path.join(t, "App.app")
+    prefix = t
+
+    # --- fixtures mimicking the conda enchant env layout (<prefix>/{lib,include,share}) ---
+    # libsub stands in for the glib stack: a transitive dep of libenchant the walk must also pull.
+    File.write!(Path.join(t, "sub.c"), "int sub(void){return 3;}\n")
+
+    clang!([
+      "-dynamiclib",
+      "-install_name",
+      "@rpath/libsub.dylib",
+      "-Wl,-headerpad_max_install_names",
+      Path.join(t, "sub.c"),
+      "-o",
+      Path.join(lib, "libsub.dylib")
+    ])
+
+    # libenchant-2.2.dylib depends on libsub.
+    File.write!(Path.join(t, "ench.c"), "int sub(void); int ench(void){return sub()+1;}\n")
+
+    clang!([
+      "-dynamiclib",
+      "-install_name",
+      "@rpath/libenchant-2.2.dylib",
+      "-Wl,-headerpad_max_install_names",
+      "-L",
+      lib,
+      "-lsub",
+      "-Wl,-rpath," <> lib,
+      Path.join(t, "ench.c"),
+      "-o",
+      Path.join(lib, "libenchant-2.2.dylib")
+    ])
+
+    # A provider bundle in <lib>/enchant-2/, depending on libenchant. It is an ORPHAN: nothing
+    # in the app links it, so relocate must SEED it for the closure walk to discover it.
+    File.mkdir_p!(Path.join(lib, "enchant-2"))
+    File.write!(Path.join(t, "prov.c"), "int ench(void); int prov(void){return ench();}\n")
+
+    clang!([
+      "-bundle",
+      "-Wl,-headerpad_max_install_names",
+      Path.join(lib, "libenchant-2.2.dylib"),
+      Path.join(t, "prov.c"),
+      "-o",
+      Path.join([lib, "enchant-2", "enchant_fake.so"])
+    ])
+
+    # Non-Mach-O SDK payload sources (headers / pc / ordering / dict), env-relative to <lib>.
+    File.mkdir_p!(Path.join([prefix, "include", "enchant-2"]))
+    File.write!(Path.join([prefix, "include", "enchant-2", "enchant.h"]), "/* fixture */\n")
+    File.mkdir_p!(Path.join(lib, "pkgconfig"))
+    File.write!(Path.join([lib, "pkgconfig", "enchant-2.pc"]), "Name: enchant\n")
+    File.mkdir_p!(Path.join([prefix, "share", "enchant-2"]))
+    File.write!(Path.join([prefix, "share", "enchant-2", "enchant.ordering"]), "*:hunspell\n")
+    File.mkdir_p!(Path.join([prefix, "share", "hunspell_dictionaries"]))
+    File.write!(Path.join([prefix, "share", "hunspell_dictionaries", "en_US.aff"]), "SET UTF-8\n")
+    File.write!(Path.join([prefix, "share", "hunspell_dictionaries", "en_US.dic"]), "1\nword\n")
+
+    # The app needs at least one Mach-O executable.
+    File.write!(Path.join(t, "main.c"), "int main(void){return 0;}\n")
+
+    clang!([
+      "-Wl,-headerpad_max_install_names",
+      Path.join(t, "main.c"),
+      "-o",
+      Path.join(app, "Contents/MacOS/App")
+    ])
+
+    assert Orchestrator.Relocate.run(app, lib) == :ok
+
+    # Providers seeded into Contents/lib/enchant-2 (Layout A).
+    seeded = Path.join([app, "Contents", "lib", "enchant-2", "enchant_fake.so"])
+    assert File.exists?(seeded)
+
+    # libenchant + its transitive dep pulled into Frameworks by the existing closure walk.
+    fw = Path.join([app, "Contents", "Frameworks"])
+    assert File.exists?(Path.join(fw, "libenchant-2.2.dylib"))
+    assert File.exists?(Path.join(fw, "libsub.dylib"))
+
+    # -lenchant-2 link-name symlink for jinx's first-use compile.
+    assert {:ok, "libenchant-2.2.dylib"} = File.read_link(Path.join(fw, "libenchant-2.dylib"))
+
+    # Provider got a depth-correct rpath to reach Frameworks (Contents/lib/enchant-2 -> ../../Frameworks).
+    assert "@loader_path/../../Frameworks" in Orchestrator.Macho.Otool.rpaths(seeded)
+
+    # Non-Mach-O SDK payload bundled under Contents/Resources/enchant-sdk.
+    sdk = Path.join([app, "Contents", "Resources", "enchant-sdk"])
+    assert File.exists?(Path.join([sdk, "include", "enchant.h"]))
+    assert File.exists?(Path.join([sdk, "enchant-2.pc"]))
+    assert File.exists?(Path.join([sdk, "config", "hunspell", "en_US.aff"]))
+    assert File.exists?(Path.join([sdk, "config", "hunspell", "en_US.dic"]))
+    # Bundled ordering selects applespell first (then hunspell) for out-of-box macOS spell-check.
+    assert File.read!(Path.join([sdk, "config", "enchant.ordering"])) =~ "applespell"
+
+    # Bundle remains validly signed after the enchant additions.
+    assert {_, 0} =
+             System.cmd("codesign", ["--verify", "--deep", "--strict", app],
+               stderr_to_stdout: true
+             )
+
+    # Clean-machine proxy: with the build libdir gone, the seeded provider must still dlopen,
+    # resolving libenchant + libsub from Frameworks via the rewritten rpaths.
+    File.write!(Path.join(t, "probe.c"), """
+    #include <dlfcn.h>
+    #include <stdio.h>
+    int main(int argc, char **argv) {
+      void *h = dlopen(argv[1], RTLD_NOW);
+      if (!h) { fprintf(stderr, "dlopen failed: %s", dlerror()); return 1; }
+      return 0;
+    }
+    """)
+
+    probe = Path.join(t, "probe")
+    clang!([Path.join(t, "probe.c"), "-o", probe])
+
+    File.rename!(lib, lib <> ".gone")
+    assert {_, 0} = System.cmd(probe, [seeded], stderr_to_stdout: true)
+  end
 end
