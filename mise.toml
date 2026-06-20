@@ -56,26 +56,8 @@ run = "bash scripts/e2e-aqua-install.sh"
 # bundle is truly self-contained it resolves its whole dylib closure from Contents/Frameworks alone.
 # pregate (.pregate/macos.sh) runs this inside its fresh disposable macOS VM; restored via trap.
 [tasks.cleanroom]
-description = "Phase 2 DoD: prove the relocated app runs with the pixi env moved aside (no-pixi launch)"
-run = '''
-set -euo pipefail
-APP="build/master/Emacs.app"
-ENV_DIR="versions/master/.pixi"
-[ -d "$APP" ] || { echo "FATAL: $APP missing — run 'mise run build && mise run relocate' first"; exit 1; }
-ASIDE="$(mktemp -d)/pixi"
-restore() { [ -d "$ASIDE" ] && mv "$ASIDE" "$ENV_DIR"; }
-trap restore EXIT
-[ -d "$ENV_DIR" ] && mv "$ENV_DIR" "$ASIDE"
-echo ">> [1] --batch (dyld must resolve the full bundled closure with the pixi env gone) — THE gate"
-"$APP/Contents/MacOS/Emacs" --batch --eval '(princ (format "ok %s\n" emacs-version))'
-echo ">> [2] GUI frame smoke (NS path; needs a display/session — best-effort)"
-if "$APP/Contents/MacOS/Emacs" -Q --eval '(run-with-timer 1 nil (lambda () (kill-emacs 0)))' 2>/dev/null; then
-  echo "   GUI frame OK"
-else
-  echo "   GUI frame skipped (no display/session — --batch is the hard gate)"
-fi
-echo ">> cleanroom: PASS — relocated app runs with no pixi env present"
-'''
+description = "Phase 2 DoD: prove the relocated app is self-contained + enchant spell-checks (pixi env aside); args: [version] (default master)"
+run = "bash pipeline/cleanroom"
 
 [tasks.decide]
 description = "Phase 5: emit the dynamic build matrix + gate flags; args: --repo <owner/repo> --date <YYYY-MM-DD> --mode <detect|force|dry-run> [--force-version <name>]"
