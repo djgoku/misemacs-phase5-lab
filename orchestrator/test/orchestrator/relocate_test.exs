@@ -340,6 +340,13 @@ defmodule Orchestrator.RelocateTest do
     # Bundled ordering selects applespell first (then hunspell) for out-of-box macOS spell-check.
     assert File.read!(Path.join([sdk, "config", "enchant.ordering"])) =~ "applespell"
 
+    # site-start.el (jinx wiring) shipped into the app's site-lisp (Emacs auto-loads it at startup).
+    site_start = Path.join([app, "Contents", "Resources", "site-lisp", "site-start.el"])
+    assert File.exists?(site_start)
+    site_start_src = File.read!(site_start)
+    assert site_start_src =~ "jinx--compile-flags"
+    assert site_start_src =~ "ENCHANT_CONFIG_DIR"
+
     # Bundle remains validly signed after the enchant additions.
     assert {_, 0} =
              System.cmd("codesign", ["--verify", "--deep", "--strict", app],

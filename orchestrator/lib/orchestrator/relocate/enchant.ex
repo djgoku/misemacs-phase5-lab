@@ -87,6 +87,12 @@ defmodule Orchestrator.Relocate.Enchant do
       for ext <- ["aff", "dic"] do
         cp_if(Path.join(dicts, "en_US.#{ext}"), Path.join([config, "hunspell", "en_US.#{ext}"]))
       end
+
+      # site-start.el: jinx <-> enchant wiring, auto-loaded at startup from the app's site-lisp.
+      cp_if(
+        Application.app_dir(:orchestrator, ["priv", "enchant", "site-start.el"]),
+        Path.join([app, "Contents", "Resources", "site-lisp", "site-start.el"])
+      )
     end
 
     :ok
