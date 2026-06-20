@@ -61,6 +61,14 @@ defmodule Orchestrator.Relocate.Enchant do
       fw = Path.join([app, "Contents", "Frameworks"])
       sdk = Path.join([app, "Contents", "Resources", "enchant-sdk"])
 
+      # The rpath rewrite (install_name_tool) invalidated the providers' code signatures, and the
+      # bundle's `codesign --deep` does NOT cover Contents/lib/enchant-2 (a non-standard nested
+      # location). Re-sign each provider now — after the rewrite, before the bundle sign seals them —
+      # else loading them via dlopen SIGKILLs on arm64 (AMFI). The otool gate can't catch this.
+      for so <- Path.wildcard(Path.join([app, "Contents", "lib", "enchant-2", "*.so"])) do
+        {_, 0} = System.cmd("codesign", ["--force", "--sign", "-", so], stderr_to_stdout: true)
+      end
+
       # -lenchant-2 link name -> the versioned dylib the walk placed in Frameworks.
       link = Path.join(fw, "libenchant-2.dylib")
 

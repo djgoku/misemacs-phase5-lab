@@ -331,6 +331,10 @@ defmodule Orchestrator.RelocateTest do
     # Provider got a depth-correct rpath to reach Frameworks (Contents/lib/enchant-2 -> ../../Frameworks).
     assert "@loader_path/../../Frameworks" in Orchestrator.Macho.Otool.rpaths(seeded)
 
+    # The rpath rewrite invalidated the provider's signature, and the bundle's codesign --deep does
+    # NOT cover this non-standard nested location — so it must be re-signed, else dlopen SIGKILLs (AMFI).
+    assert {_, 0} = System.cmd("codesign", ["--verify", seeded], stderr_to_stdout: true)
+
     # Non-Mach-O SDK payload bundled under Contents/Resources/enchant-sdk.
     sdk = Path.join([app, "Contents", "Resources", "enchant-sdk"])
     assert File.exists?(Path.join([sdk, "include", "enchant.h"]))
