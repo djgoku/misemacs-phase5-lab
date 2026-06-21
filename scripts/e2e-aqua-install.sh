@@ -15,6 +15,7 @@ fi
 
 shift
 REPO="${1:?}"; TAG="${2:?}"; URL="${3:?}"
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"   # repo root — captured before we cd to a temp dir
 export MISE_AQUA_REGISTRY_URL="$URL"
 export MISE_DATA_DIR; MISE_DATA_DIR="$(mktemp -d)"
 export MISE_CACHE_DIR; MISE_CACHE_DIR="$(mktemp -d)"   # separate from DATA — both must be fresh (P8 gotcha)
@@ -45,5 +46,15 @@ echo ">> [5] quarantine-free install (E1 invariant via aqua's Go extraction)"
 qcount="$(find "$INSTALL" -exec xattr -l {} + 2>/dev/null | grep -c com.apple.quarantine || true)"
 [ "$qcount" = "0" ] || { echo "FATAL: $qcount quarantine xattrs in the install tree"; exit 1; }
 echo "E2E-NO-QUARANTINE"
+
+echo ">> [6] enchant spell-check (the jinx feature) through the bundled providers, on the installed app"
+APP="$(/bin/ls -d "$INSTALL"/misemacs-*/Emacs.app 2>/dev/null | head -1)"
+[ -n "$APP" ] || { echo "FATAL: no Emacs.app under the mise install ($INSTALL)"; exit 1; }
+if command -v clang >/dev/null 2>&1; then
+  bash "$HERE/pipeline/enchant-gate" "$APP" "e2e:$REPO@$TAG"   # hard gate: AppleSpell + hunspell, C + Emacs module
+  echo "E2E-ENCHANT-OK"
+else
+  echo "E2E-ENCHANT-SKIPPED (no clang — jinx's first-use compile can't be exercised in this VM)"
+fi
 
 echo ">> e2e: PASS — $REPO@$TAG installs and runs on a clean box"
