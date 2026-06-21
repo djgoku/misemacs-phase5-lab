@@ -304,6 +304,13 @@ defmodule Orchestrator.RelocateTest do
     File.write!(Path.join([prefix, "share", "hunspell_dictionaries", "en_US.aff"]), "SET UTF-8\n")
     File.write!(Path.join([prefix, "share", "hunspell_dictionaries", "en_US.dic"]), "1\nword\n")
 
+    # A previous bad cleanroom run could leave AppleSpell personal word-list files in the signed
+    # SDK template. Rebasing the SDK payload must not preserve those stale user-writable artifacts.
+    stale_config = Path.join([app, "Contents", "Resources", "enchant-sdk", "config"])
+    File.mkdir_p!(stale_config)
+    File.write!(Path.join(stale_config, "en_US.dic"), "")
+    File.write!(Path.join(stale_config, "en_US.exc"), "")
+
     # The app needs at least one Mach-O executable.
     File.write!(Path.join(t, "main.c"), "int main(void){return 0;}\n")
 
@@ -338,18 +345,31 @@ defmodule Orchestrator.RelocateTest do
     # Non-Mach-O SDK payload bundled under Contents/Resources/enchant-sdk.
     sdk = Path.join([app, "Contents", "Resources", "enchant-sdk"])
     assert File.exists?(Path.join([sdk, "include", "enchant.h"]))
+    assert File.exists?(Path.join([sdk, "include", "misemacs-jinx-enchant-env.h"]))
     assert File.exists?(Path.join([sdk, "enchant-2.pc"]))
     assert File.exists?(Path.join([sdk, "config", "hunspell", "en_US.aff"]))
     assert File.exists?(Path.join([sdk, "config", "hunspell", "en_US.dic"]))
-    # Bundled ordering selects applespell first (then hunspell) for out-of-box macOS spell-check.
-    assert File.read!(Path.join([sdk, "config", "enchant.ordering"])) =~ "applespell"
+    assert File.read!(Path.join([sdk, "config", "AppleSpell.config"])) == "en_US en en\n"
+    refute File.exists?(Path.join([sdk, "config", "en_US.dic"]))
+    refute File.exists?(Path.join([sdk, "config", "en_US.exc"]))
+    # Bundled ordering prefers AppleSpell; hunspell remains bundled as the deterministic fallback.
+    assert File.read!(Path.join([sdk, "config", "enchant.ordering"])) == "*:AppleSpell,hunspell\n"
 
     # site-start.el (jinx wiring) shipped into the app's site-lisp (Emacs auto-loads it at startup).
     site_start = Path.join([app, "Contents", "Resources", "site-lisp", "site-start.el"])
     assert File.exists?(site_start)
     site_start_src = File.read!(site_start)
     assert site_start_src =~ "jinx--compile-flags"
+    assert site_start_src =~ "misemacs-jinx-enchant-env.h"
+    assert site_start_src =~ "MISEMACS_ENCHANT_CONFIG_DIR"
+    assert site_start_src =~ "misemacs-jinx-enchant-env/1"
+    assert site_start_src =~ "misemacs--seed-enchant-config"
+    assert site_start_src =~ "misemacs--copy-file-if-missing"
+    assert site_start_src =~ "misemacs--without-jinx-enchant-flags"
+    assert site_start_src =~ "(concat \"-Wl,-rpath,\" frameworks)"
+    assert site_start_src =~ "(not (misemacs--file-contains-literal-p mod-file frameworks))"
     assert site_start_src =~ "ENCHANT_CONFIG_DIR"
+    refute site_start_src =~ "copy-directory sdk-config cfg t t t"
 
     # Bundle remains validly signed after the enchant additions.
     assert {_, 0} =
@@ -374,5 +394,24 @@ defmodule Orchestrator.RelocateTest do
 
     File.rename!(lib, lib <> ".gone")
     assert {_, 0} = System.cmd(probe, [seeded], stderr_to_stdout: true)
+  end
+
+  test "cleanroom validates shipped AppleSpell config and bundled hunspell fallback" do
+    cleanroom = File.read!(Path.expand("../../../pipeline/cleanroom", __DIR__))
+
+    assert cleanroom =~ "ENV_DIR=\"$HERE/versions/$VERSION/.pixi/envs/default\""
+    refute cleanroom =~ "ENV_DIR=\"$HERE/versions/$VERSION/.pixi\""
+    assert cleanroom =~ "SHIPPED_CFG=\"$WORK/cfg-shipped\""
+    assert cleanroom =~ "cp -R \"$SDK/config/.\" \"$SHIPPED_CFG/\""
+    assert cleanroom =~ "check_config shipped \"$SHIPPED_CFG\" AppleSpell"
+    refute cleanroom =~ "check_config shipped \"$SDK/config\" AppleSpell"
+    assert cleanroom =~ "check_config hunspell \"$HUNSPELL_CFG\" hunspell"
+    assert cleanroom =~ "run_module_probe shipped \"$SHIPPED_CFG\" AppleSpell"
+    assert cleanroom =~ "run_module_probe hunspell \"$MODULE_HUNSPELL_CFG\" hunspell"
+    assert cleanroom =~ "AppleSpell.config"
+    assert cleanroom =~ "-Wl,-rpath,\"$FW\""
+    assert cleanroom =~ "FATAL: $ENV_DIR was recreated while cleanroom held it aside"
+    assert cleanroom =~ "mv \"$ASIDE\" \"$ENV_DIR\" || {"
+    assert cleanroom =~ "FATAL: restore mv failed; backup preserved at $ASIDE"
   end
 end

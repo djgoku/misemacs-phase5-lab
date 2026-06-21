@@ -3,22 +3,49 @@
 # by exercising it with the per-version pixi env moved aside. Three gates:
 #   [1] dyld closure : Emacs --batch must launch (resolve its whole bundled dylib closure).
 #   [2] GUI frame    : NS frame smoke (best-effort; needs a display/session).
-#   [3] enchant      : compile a tiny enchant probe with the SAME flags site-start.el injects, then
-#                      spell-check a known misspelling through BOTH providers (applespell + bundled
-#                      hunspell). The otool gate (mix relocate) can't see dlopen/data — THIS proves
-#                      the bundled providers dlopen + the dict resolves with no pixi env present.
+#   [3] enchant      : compile tiny standalone + Emacs-module probes with the same bundled SDK/rpath
+#                      shape site-start.el gives jinx, then spell-check through shipped AppleSpell
+#                      config and bundled hunspell fallback.
+#                      The otool gate (mix relocate) can't see dlopen/data — THIS proves the bundled
+#                      providers + dict resolve with no pixi env present.
 # Default version: master. Run after `mise run build <v> && mise run relocate <v>`.
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 VERSION="${1:-master}"
 APP="$HERE/build/$VERSION/Emacs.app"
-ENV_DIR="$HERE/versions/$VERSION/.pixi"
+ENV_DIR="$HERE/versions/$VERSION/.pixi/envs/default"
 [ -d "$APP" ] || { echo "FATAL: $APP missing — run 'mise run build $VERSION && mise run relocate $VERSION' first"; exit 1; }
 
-ASIDE="$(mktemp -d)/pixi"
+ASIDE_PARENT="$(mktemp -d)"
+ASIDE="$ASIDE_PARENT/default"
 WORK="$(mktemp -d)"
-restore() { [ -d "$ASIDE" ] && mv "$ASIDE" "$ENV_DIR"; }
-trap 'restore; rm -rf "$WORK"' EXIT
+restore() {
+  if [ -d "$ASIDE" ]; then
+    if [ -e "$ENV_DIR" ]; then
+      echo "FATAL: $ENV_DIR was recreated while cleanroom held it aside; backup preserved at $ASIDE" >&2
+      return 1
+    fi
+    mkdir -p "$(dirname "$ENV_DIR")" || {
+      echo "FATAL: restore mkdir failed; backup preserved at $ASIDE" >&2
+      return 1
+    }
+    mv "$ASIDE" "$ENV_DIR" || {
+      echo "FATAL: restore mv failed; backup preserved at $ASIDE" >&2
+      return 1
+    }
+  fi
+  rm -rf "$ASIDE_PARENT"
+}
+cleanup() {
+  local rc=$?
+  if ! restore; then
+    rm -rf "$WORK"
+    exit 1
+  fi
+  rm -rf "$WORK"
+  exit "$rc"
+}
+trap cleanup EXIT
 # Hermetic HOME so the bundled site-start.el seeds its per-user enchant dir into the throwaway dir,
 # not the real ~/.emacs.d.
 export HOME="$WORK"
@@ -36,28 +63,67 @@ else
   echo "   GUI frame skipped (no display/session — --batch is the hard gate)"
 fi
 
-echo ">> [3] enchant functional gate: spell-check through the bundled providers (env gone)"
+echo ">> [3] enchant functional gate: spell-check through shipped AppleSpell + bundled hunspell (env gone)"
 SDK="$APP/Contents/Resources/enchant-sdk"
 FW="$APP/Contents/Frameworks"
+EMACS_INCLUDE="$APP/Contents/Resources/include"
 [ -d "$SDK" ] || { echo "FATAL: $SDK missing — enchant not bundled by relocate"; exit 1; }
+[ -f "$SDK/config/AppleSpell.config" ] || { echo "FATAL: $SDK/config/AppleSpell.config missing"; exit 1; }
+[ -f "$SDK/config/enchant.ordering" ] || { echo "FATAL: $SDK/config/enchant.ordering missing"; exit 1; }
 
 cat > "$WORK/probe.c" <<'EOF'
 #include <enchant.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
-/* exit 0 iff `word` is flagged misspelled for `lang` (proves the provider + dict resolve). */
+
+struct probe_result {
+  char provider[64];
+};
+
+static void describe_cb(const char * const lang_tag,
+                        const char * const provider_name,
+                        const char * const provider_desc,
+                        const char * const provider_file,
+                        void *data) {
+  (void)lang_tag;
+  (void)provider_desc;
+  (void)provider_file;
+  snprintf(((struct probe_result *)data)->provider,
+           sizeof(((struct probe_result *)data)->provider),
+           "%s",
+           provider_name ? provider_name : "");
+}
+
 int main(int argc, char **argv) {
   const char *lang = argc > 1 ? argv[1] : "en_US";
-  const char *word = argc > 2 ? argv[2] : "helllo";
+  const char *expected_provider = argc > 2 ? argv[2] : "";
   EnchantBroker *b = enchant_broker_init();
   if (!b) { fprintf(stderr, "FAIL: enchant_broker_init returned NULL\n"); return 2; }
   EnchantDict *d = enchant_broker_request_dict(b, lang);
   if (!d) { fprintf(stderr, "FAIL: no dictionary for %s\n", lang); return 3; }
-  int bad = enchant_dict_check(d, word, strlen(word));
-  fprintf(stderr, "   check(%s, \"%s\") = %d\n", lang, word, bad);
+
+  struct probe_result result = {0};
+  enchant_dict_describe(d, describe_cb, &result);
+  int misspelled = enchant_dict_check(d, "helllo", strlen("helllo"));
+  int correct = enchant_dict_check(d, "hello", strlen("hello"));
+  fprintf(stderr, "   provider=%s helllo=%d hello=%d ENCHANT_CONFIG_DIR=%s\n",
+          result.provider[0] ? result.provider : "(nil)",
+          misspelled,
+          correct,
+          getenv("ENCHANT_CONFIG_DIR"));
+
+  int ok = misspelled > 0 && correct == 0;
+  if (expected_provider[0] && strcmp(result.provider, expected_provider) != 0) {
+    fprintf(stderr, "FAIL: expected provider %s, got %s\n",
+            expected_provider,
+            result.provider[0] ? result.provider : "(nil)");
+    ok = 0;
+  }
+
   enchant_broker_free_dict(b, d);
   enchant_broker_free(b);
-  return bad > 0 ? 0 : 1;
+  return ok ? 0 : 1;
 }
 EOF
 
@@ -66,21 +132,138 @@ EOF
 clang -I"$SDK/include" -L"$FW" -Wl,-rpath,"$FW" -lenchant-2 "$WORK/probe.c" -o "$WORK/probe"
 echo "   probe compiled against the bundle (system clang; pixi env gone)"
 
-check_provider() {  # <name> <ordering-line>
-  local name="$1" ordering="$2" cfg="$WORK/cfg-$1"
-  mkdir -p "$cfg/hunspell"
-  cp "$SDK/config/hunspell/"en_US.* "$cfg/hunspell/" 2>/dev/null || true
-  printf '%s\n' "$ordering" > "$cfg/enchant.ordering"
-  if ! ENCHANT_CONFIG_DIR="$cfg" "$WORK/probe" en_US helllo; then
-    echo "   FAIL: $name did not flag misspelled 'helllo'"; return 1
+check_config() {  # <name> <config-dir> <expected-provider>
+  local name="$1" cfg="$2" expected_provider="$3"
+  [ -f "$cfg/enchant.ordering" ] || { echo "   FAIL: $name missing enchant.ordering"; return 1; }
+  if ! ENCHANT_CONFIG_DIR="$cfg" "$WORK/probe" en_US "$expected_provider"; then
+    echo "   FAIL: $name did not spell-check en_US with $expected_provider"; return 1
   fi
-  if ENCHANT_CONFIG_DIR="$cfg" "$WORK/probe" en_US hello; then
-    echo "   FAIL: $name flagged correct 'hello' as misspelled"; return 1
-  fi
-  echo "   $name: OK (flagged 'helllo', accepted 'hello')"
+  echo "   $name: OK ($expected_provider flagged 'helllo', accepted 'hello')"
 }
 
-check_provider applespell '*:applespell'
-check_provider hunspell   '*:hunspell'
+SHIPPED_CFG="$WORK/cfg-shipped"
+mkdir -p "$SHIPPED_CFG"
+cp -R "$SDK/config/." "$SHIPPED_CFG/"
+check_config shipped "$SHIPPED_CFG" AppleSpell
 
-echo ">> cleanroom: PASS — $VERSION app self-contained; enchant spell-checks via BOTH providers (no pixi env)"
+HUNSPELL_CFG="$WORK/cfg-hunspell"
+mkdir -p "$HUNSPELL_CFG/hunspell"
+cp "$SDK/config/hunspell/"en_US.* "$HUNSPELL_CFG/hunspell/" 2>/dev/null || true
+printf '%s\n' '*:hunspell,AppleSpell' > "$HUNSPELL_CFG/enchant.ordering"
+check_config hunspell "$HUNSPELL_CFG" hunspell
+
+echo "   Emacs native module probes (same native env bridge and absolute bundle rpath jinx uses)"
+cat > "$WORK/emacs-enchant-probe.c" <<'EOF'
+#include <emacs-module.h>
+#include <enchant.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#ifndef MISEMACS_EXPECTED_PROVIDER
+#define MISEMACS_EXPECTED_PROVIDER ""
+#endif
+
+int plugin_is_GPL_compatible;
+
+struct probe_result {
+  char provider[64];
+};
+
+static void describe_cb(const char * const lang_tag,
+                        const char * const provider_name,
+                        const char * const provider_desc,
+                        const char * const provider_file,
+                        void *data) {
+  (void)lang_tag;
+  (void)provider_desc;
+  (void)provider_file;
+  snprintf(((struct probe_result *)data)->provider,
+           sizeof(((struct probe_result *)data)->provider),
+           "%s",
+           provider_name ? provider_name : "");
+}
+
+static emacs_value probe(emacs_env *env, ptrdiff_t nargs, emacs_value args[], void *data) {
+  (void)nargs;
+  (void)args;
+  (void)data;
+
+  EnchantBroker *broker = enchant_broker_init();
+  if (!broker) {
+    fprintf(stderr, "   Emacs module: no enchant broker; ENCHANT_CONFIG_DIR=%s\n",
+            getenv("ENCHANT_CONFIG_DIR"));
+    return env->intern(env, "nil");
+  }
+
+  EnchantDict *dict = enchant_broker_request_dict(broker, "en_US");
+  if (!dict) {
+    fprintf(stderr, "   Emacs module: no en_US dict; ENCHANT_CONFIG_DIR=%s\n",
+            getenv("ENCHANT_CONFIG_DIR"));
+    enchant_broker_free(broker);
+    return env->intern(env, "nil");
+  }
+
+  struct probe_result result = {0};
+  enchant_dict_describe(dict, describe_cb, &result);
+  int misspelled = enchant_dict_check(dict, "helllo", strlen("helllo"));
+  int correct = enchant_dict_check(dict, "hello", strlen("hello"));
+  fprintf(stderr, "   Emacs module: provider=%s helllo=%d hello=%d ENCHANT_CONFIG_DIR=%s\n",
+          result.provider[0] ? result.provider : "(nil)",
+          misspelled,
+          correct,
+          getenv("ENCHANT_CONFIG_DIR"));
+  int ok = misspelled > 0 && correct == 0;
+  if (MISEMACS_EXPECTED_PROVIDER[0] &&
+      strcmp(result.provider, MISEMACS_EXPECTED_PROVIDER) != 0) {
+    fprintf(stderr, "   Emacs module: expected provider %s, got %s\n",
+            MISEMACS_EXPECTED_PROVIDER,
+            result.provider[0] ? result.provider : "(nil)");
+    ok = 0;
+  }
+
+  enchant_broker_free_dict(broker, dict);
+  enchant_broker_free(broker);
+
+  return env->intern(env, ok ? "t" : "nil");
+}
+
+int emacs_module_init(struct emacs_runtime *runtime) {
+  emacs_env *env = runtime->get_environment(runtime);
+  emacs_value symbol = env->intern(env, "misemacs-enchant-probe");
+  emacs_value function = env->make_function(env, 0, 0, probe, "Probe bundled enchant.", NULL);
+  env->funcall(env, env->intern(env, "defalias"), 2, (emacs_value[]){symbol, function});
+  return 0;
+}
+EOF
+
+SHIM="$SDK/include/misemacs-jinx-enchant-env.h"
+[ -f "$SHIM" ] || { echo "FATAL: $SHIM missing — jinx native env bridge not bundled"; exit 1; }
+run_module_probe() { # <name> <config-dir> <expected-provider>
+  local name="$1" cfg="$2" expected_provider="$3"
+  local module="$WORK/emacs-enchant-probe-$name.dylib"
+  clang -I"$SDK/include" \
+    -I"$EMACS_INCLUDE" \
+    -include "$SHIM" \
+    "-DMISEMACS_ENCHANT_CONFIG_DIR=\"$cfg\"" \
+    "-DMISEMACS_EXPECTED_PROVIDER=\"$expected_provider\"" \
+    -L"$FW" \
+    -Wl,-rpath,"$FW" \
+    -lenchant-2 \
+    -fPIC \
+    -shared \
+    "$WORK/emacs-enchant-probe.c" \
+    -o "$module"
+  "$APP/Contents/MacOS/Emacs" -Q --batch \
+    --eval "(progn (module-load \"$module\") (unless (misemacs-enchant-probe) (error \"native module enchant probe failed for $name\")) (princ \"   Emacs module $name: OK (native ENCHANT_CONFIG_DIR -> $expected_provider)\\n\"))"
+}
+
+run_module_probe shipped "$SHIPPED_CFG" AppleSpell
+
+MODULE_HUNSPELL_CFG="$WORK/cfg-emacs-module-hunspell"
+mkdir -p "$MODULE_HUNSPELL_CFG/hunspell"
+cp "$SDK/config/hunspell/"en_US.* "$MODULE_HUNSPELL_CFG/hunspell/" 2>/dev/null || true
+printf '%s\n' '*:hunspell,AppleSpell' > "$MODULE_HUNSPELL_CFG/enchant.ordering"
+run_module_probe hunspell "$MODULE_HUNSPELL_CFG" hunspell
+
+echo ">> cleanroom: PASS — $VERSION app self-contained; shipped AppleSpell config and bundled hunspell spell-check from C and Emacs native modules (no pixi env)"

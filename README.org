@@ -37,6 +37,40 @@ mise exec -- Emacs --version
 
 mise verifies the downloaded asset against GitHub's release digest. (The first release appears once the daily workflow has run — see *How it works* below.)
 
+* Spell checking with jinx
+
+misemacs bundles a relocatable Enchant 2 stack for [[https://github.com/minad/jinx][jinx]]: =libenchant=, the =hunspell= and =AppleSpell= providers, the =en_US= hunspell dictionary, and the headers/link flags jinx needs when it compiles =jinx-mod.dylib=. The user still installs jinx in their Emacs config; misemacs only supplies the native spell-checking runtime.
+
+On launch, =site-start.el= seeds any missing bundled files into a writable Enchant config directory at =user-emacs-directory/enchant= without overwriting your edits. If you launch with =--init-directory DIR=, use =DIR/enchant= below; otherwise the default is =~/.emacs.d/enchant=.
+
+The default provider order is AppleSpell first, with hunspell as the bundled fallback:
+
+#+begin_src sh
+CFG="$HOME/.emacs.d/enchant"  # or DIR/enchant when using --init-directory DIR
+printf 'en_US en en\n' > "$CFG/AppleSpell.config"
+printf '*:AppleSpell,hunspell\n' > "$CFG/enchant.ordering"
+#+end_src
+
+To force bundled hunspell first instead:
+
+#+begin_src sh
+CFG="$HOME/.emacs.d/enchant"  # or DIR/enchant when using --init-directory DIR
+printf '*:hunspell,AppleSpell\n' > "$CFG/enchant.ordering"
+#+end_src
+
+Restart Emacs after changing provider order once jinx has loaded. jinx's native module keeps an Enchant broker in-process, so changing =enchant.ordering= in a live Emacs is not a reliable provider switch.
+
+To verify the active provider from Emacs:
+
+#+begin_src emacs-lisp
+(progn
+  (setq-local jinx-languages "en_US")
+  (jinx-mode 1)
+  (jinx--mod-describe (car jinx--dicts)))
+#+end_src
+
+You should see =("en_US" . "hunspell")= or =("en_US" . "AppleSpell")=.
+
 * How it works
 
 A small *Elixir orchestrator* makes every decision (pure, unit-tested functions), a *bash pipeline* does the heavy lifting, and *mise + pixi* lock every input. GitHub Actions runs it daily behind a cheap change-detection gate, so the expensive macOS build only fires when upstream moved.

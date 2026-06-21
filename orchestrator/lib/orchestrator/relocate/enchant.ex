@@ -12,17 +12,19 @@ defmodule Orchestrator.Relocate.Enchant do
 
   Then we bundle the non-Mach-O payload the generic relocate doesn't touch: the `-lenchant-2`
   link-name symlink (for jinx's first-use compile) and an SDK dir under
-  `Contents/Resources/enchant-sdk/` (headers, `enchant-2.pc`, an applespell-first ordering, and
-  the hunspell `en_US` dict — the template `site-start.el` seeds a writable `ENCHANT_CONFIG_DIR`
-  from).
+  `Contents/Resources/enchant-sdk/` (headers, `enchant-2.pc`, an AppleSpell-first ordering,
+  AppleSpell language mapping, and the hunspell `en_US` dict — the template `site-start.el` seeds
+  a writable `ENCHANT_CONFIG_DIR` from).
 
   Every step is conditional on the build env actually shipping enchant
   (`<build_libdir>/enchant-2/`), so a non-enchant build relocates exactly as before.
   """
 
-  # applespell first (macOS NSSpellChecker, no dict files), hunspell fallback (bundled en_US dict).
-  # enchant's stock ordering omits applespell, so we ship our own.
-  @ordering "*:applespell,hunspell\n"
+  # Prefer macOS AppleSpell while retaining bundled hunspell as a deterministic fallback.
+  @ordering "*:AppleSpell,hunspell\n"
+  # AppleSpell's provider reads AppleSpell.config and maps enchant tags to NSSpellChecker language
+  # names. On macOS, NSSpellChecker generally exposes English as "en", not "en_US".
+  @apple_spell_config "en_US en en\n"
 
   @doc "True if the build env ships enchant providers (so the enchant steps should run)."
   @spec present?(Path.t()) :: boolean
@@ -51,7 +53,7 @@ defmodule Orchestrator.Relocate.Enchant do
   @doc """
   After the Mach-O rewrite (libenchant now lives in Frameworks) and BEFORE signing (so it gets
   sealed), add the non-Mach-O payload: the `-lenchant-2` link-name symlink in Frameworks plus the
-  SDK (headers, `enchant-2.pc`, applespell-first ordering, hunspell dict) under
+  SDK (headers, `enchant-2.pc`, AppleSpell-first ordering, AppleSpell mapping, hunspell dict) under
   `Contents/Resources/enchant-sdk/`.
   """
   @spec bundle_sdk(Path.t(), Path.t()) :: :ok
@@ -78,6 +80,12 @@ defmodule Orchestrator.Relocate.Enchant do
 
       # SDK headers, flattened so jinx compiles with a single -I<sdk>/include.
       copy_dir(Path.join([prefix, "include", "enchant-2"]), Path.join(sdk, "include"))
+
+      cp_if(
+        Application.app_dir(:orchestrator, ["priv", "enchant", "misemacs-jinx-enchant-env.h"]),
+        Path.join([sdk, "include", "misemacs-jinx-enchant-env.h"])
+      )
+
       # enchant-2.pc (reference; jinx wires -I/-L directly, no pkg-config).
       cp_if(
         Path.join([build_libdir, "pkgconfig", "enchant-2.pc"]),
@@ -85,10 +93,12 @@ defmodule Orchestrator.Relocate.Enchant do
       )
 
       # Writable ENCHANT_CONFIG_DIR template (site-start.el seeds a per-user copy from this):
-      # an applespell-first ordering + the hunspell dict under hunspell/.
+      # AppleSpell-first ordering + AppleSpell language mapping + the hunspell fallback dict.
       config = Path.join(sdk, "config")
+      File.rm_rf!(config)
       File.mkdir_p!(config)
       File.write!(Path.join(config, "enchant.ordering"), @ordering)
+      File.write!(Path.join(config, "AppleSpell.config"), @apple_spell_config)
 
       dicts = Path.join([prefix, "share", "hunspell_dictionaries"])
 
