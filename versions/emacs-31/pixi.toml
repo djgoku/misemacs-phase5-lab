@@ -3,6 +3,7 @@ authors = ["Jonathan Carroll Otsuka <105506+djgoku@users.noreply.github.com>"]
 channels = ["conda-forge"]
 name = "emacs-31"
 platforms = ["osx-arm64"]
+preview = ["pixi-build"]
 version = "0.1.0"
 
 [tasks]
@@ -17,3 +18,5 @@ gnutls = ">=3.8.13,<4"
 # libxml-2.0.pc + headers so Emacs's pkg-config check uses THIS libxml2, not system. (Phase 1, V6)
 libxml2 = "<2.14"
 libtree-sitter = ">=0.26.9,<0.27"
+enchant = { git = "https://github.com/djgoku/enchant-feedstock", branch = "misemacs-recipe", subdirectory = "recipe" }
+hunspell-en = ">=2024.3.1,<2025"

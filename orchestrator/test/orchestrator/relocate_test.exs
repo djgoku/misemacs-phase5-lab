@@ -241,4 +241,177 @@ defmodule Orchestrator.RelocateTest do
     assert {:error, violations} = Orchestrator.Relocate.run(app, lib)
     assert Enum.any?(violations, &match?({:missing_lib, _, "@rpath/libmissing.dylib"}, &1))
   end
+
+  test "relocate seeds enchant providers, bundles libenchant + SDK, provider dlopens with build libdir gone",
+       %{t: t} do
+    lib = Path.join(t, "buildlib")
+    app = Path.join(t, "App.app")
+    prefix = t
+
+    # --- fixtures mimicking the conda enchant env layout (<prefix>/{lib,include,share}) ---
+    # libsub stands in for the glib stack: a transitive dep of libenchant the walk must also pull.
+    File.write!(Path.join(t, "sub.c"), "int sub(void){return 3;}\n")
+
+    clang!([
+      "-dynamiclib",
+      "-install_name",
+      "@rpath/libsub.dylib",
+      "-Wl,-headerpad_max_install_names",
+      Path.join(t, "sub.c"),
+      "-o",
+      Path.join(lib, "libsub.dylib")
+    ])
+
+    # libenchant-2.2.dylib depends on libsub.
+    File.write!(Path.join(t, "ench.c"), "int sub(void); int ench(void){return sub()+1;}\n")
+
+    clang!([
+      "-dynamiclib",
+      "-install_name",
+      "@rpath/libenchant-2.2.dylib",
+      "-Wl,-headerpad_max_install_names",
+      "-L",
+      lib,
+      "-lsub",
+      "-Wl,-rpath," <> lib,
+      Path.join(t, "ench.c"),
+      "-o",
+      Path.join(lib, "libenchant-2.2.dylib")
+    ])
+
+    # A provider bundle in <lib>/enchant-2/, depending on libenchant. It is an ORPHAN: nothing
+    # in the app links it, so relocate must SEED it for the closure walk to discover it.
+    File.mkdir_p!(Path.join(lib, "enchant-2"))
+    File.write!(Path.join(t, "prov.c"), "int ench(void); int prov(void){return ench();}\n")
+
+    clang!([
+      "-bundle",
+      "-Wl,-headerpad_max_install_names",
+      Path.join(lib, "libenchant-2.2.dylib"),
+      Path.join(t, "prov.c"),
+      "-o",
+      Path.join([lib, "enchant-2", "enchant_fake.so"])
+    ])
+
+    # Non-Mach-O SDK payload sources (headers / pc / ordering / dict), env-relative to <lib>.
+    File.mkdir_p!(Path.join([prefix, "include", "enchant-2"]))
+    File.write!(Path.join([prefix, "include", "enchant-2", "enchant.h"]), "/* fixture */\n")
+    File.mkdir_p!(Path.join(lib, "pkgconfig"))
+    File.write!(Path.join([lib, "pkgconfig", "enchant-2.pc"]), "Name: enchant\n")
+    File.mkdir_p!(Path.join([prefix, "share", "enchant-2"]))
+    File.write!(Path.join([prefix, "share", "enchant-2", "enchant.ordering"]), "*:hunspell\n")
+    File.mkdir_p!(Path.join([prefix, "share", "hunspell_dictionaries"]))
+    File.write!(Path.join([prefix, "share", "hunspell_dictionaries", "en_US.aff"]), "SET UTF-8\n")
+    File.write!(Path.join([prefix, "share", "hunspell_dictionaries", "en_US.dic"]), "1\nword\n")
+
+    # A previous bad cleanroom run could leave AppleSpell personal word-list files in the signed
+    # SDK template. Rebasing the SDK payload must not preserve those stale user-writable artifacts.
+    stale_config = Path.join([app, "Contents", "Resources", "enchant-sdk", "config"])
+    File.mkdir_p!(stale_config)
+    File.write!(Path.join(stale_config, "en_US.dic"), "")
+    File.write!(Path.join(stale_config, "en_US.exc"), "")
+
+    # The app needs at least one Mach-O executable.
+    File.write!(Path.join(t, "main.c"), "int main(void){return 0;}\n")
+
+    clang!([
+      "-Wl,-headerpad_max_install_names",
+      Path.join(t, "main.c"),
+      "-o",
+      Path.join(app, "Contents/MacOS/App")
+    ])
+
+    assert Orchestrator.Relocate.run(app, lib) == :ok
+
+    # Providers seeded into Contents/lib/enchant-2 (Layout A).
+    seeded = Path.join([app, "Contents", "lib", "enchant-2", "enchant_fake.so"])
+    assert File.exists?(seeded)
+
+    # libenchant + its transitive dep pulled into Frameworks by the existing closure walk.
+    fw = Path.join([app, "Contents", "Frameworks"])
+    assert File.exists?(Path.join(fw, "libenchant-2.2.dylib"))
+    assert File.exists?(Path.join(fw, "libsub.dylib"))
+
+    # -lenchant-2 link-name symlink for jinx's first-use compile.
+    assert {:ok, "libenchant-2.2.dylib"} = File.read_link(Path.join(fw, "libenchant-2.dylib"))
+
+    # Provider got a depth-correct rpath to reach Frameworks (Contents/lib/enchant-2 -> ../../Frameworks).
+    assert "@loader_path/../../Frameworks" in Orchestrator.Macho.Otool.rpaths(seeded)
+
+    # The rpath rewrite invalidated the provider's signature, and the bundle's codesign --deep does
+    # NOT cover this non-standard nested location — so it must be re-signed, else dlopen SIGKILLs (AMFI).
+    assert {_, 0} = System.cmd("codesign", ["--verify", seeded], stderr_to_stdout: true)
+
+    # Non-Mach-O SDK payload bundled under Contents/Resources/enchant-sdk.
+    sdk = Path.join([app, "Contents", "Resources", "enchant-sdk"])
+    assert File.exists?(Path.join([sdk, "include", "enchant.h"]))
+    assert File.exists?(Path.join([sdk, "include", "misemacs-jinx-enchant-env.h"]))
+    assert File.exists?(Path.join([sdk, "enchant-2.pc"]))
+    assert File.exists?(Path.join([sdk, "config", "hunspell", "en_US.aff"]))
+    assert File.exists?(Path.join([sdk, "config", "hunspell", "en_US.dic"]))
+    assert File.read!(Path.join([sdk, "config", "AppleSpell.config"])) == "en_US en en\n"
+    refute File.exists?(Path.join([sdk, "config", "en_US.dic"]))
+    refute File.exists?(Path.join([sdk, "config", "en_US.exc"]))
+    # Bundled ordering prefers AppleSpell; hunspell remains bundled as the deterministic fallback.
+    assert File.read!(Path.join([sdk, "config", "enchant.ordering"])) == "*:AppleSpell,hunspell\n"
+
+    # site-start.el (jinx wiring) shipped into the app's site-lisp (Emacs auto-loads it at startup).
+    site_start = Path.join([app, "Contents", "Resources", "site-lisp", "site-start.el"])
+    assert File.exists?(site_start)
+    site_start_src = File.read!(site_start)
+    assert site_start_src =~ "jinx--compile-flags"
+    assert site_start_src =~ "misemacs-jinx-enchant-env.h"
+    assert site_start_src =~ "MISEMACS_ENCHANT_CONFIG_DIR"
+    assert site_start_src =~ "misemacs-jinx-enchant-env/1"
+    assert site_start_src =~ "misemacs--seed-enchant-config"
+    assert site_start_src =~ "misemacs--copy-file-if-missing"
+    assert site_start_src =~ "misemacs--without-jinx-enchant-flags"
+    assert site_start_src =~ "(concat \"-Wl,-rpath,\" frameworks)"
+    assert site_start_src =~ "(not (misemacs--file-contains-literal-p mod-file frameworks))"
+    assert site_start_src =~ "ENCHANT_CONFIG_DIR"
+    refute site_start_src =~ "copy-directory sdk-config cfg t t t"
+
+    # Bundle remains validly signed after the enchant additions.
+    assert {_, 0} =
+             System.cmd("codesign", ["--verify", "--deep", "--strict", app],
+               stderr_to_stdout: true
+             )
+
+    # Clean-machine proxy: with the build libdir gone, the seeded provider must still dlopen,
+    # resolving libenchant + libsub from Frameworks via the rewritten rpaths.
+    File.write!(Path.join(t, "probe.c"), """
+    #include <dlfcn.h>
+    #include <stdio.h>
+    int main(int argc, char **argv) {
+      void *h = dlopen(argv[1], RTLD_NOW);
+      if (!h) { fprintf(stderr, "dlopen failed: %s", dlerror()); return 1; }
+      return 0;
+    }
+    """)
+
+    probe = Path.join(t, "probe")
+    clang!([Path.join(t, "probe.c"), "-o", probe])
+
+    File.rename!(lib, lib <> ".gone")
+    assert {_, 0} = System.cmd(probe, [seeded], stderr_to_stdout: true)
+  end
+
+  test "cleanroom validates shipped AppleSpell config and bundled hunspell fallback" do
+    cleanroom = File.read!(Path.expand("../../../pipeline/cleanroom", __DIR__))
+
+    assert cleanroom =~ "ENV_DIR=\"$HERE/versions/$VERSION/.pixi/envs/default\""
+    refute cleanroom =~ "ENV_DIR=\"$HERE/versions/$VERSION/.pixi\""
+    assert cleanroom =~ "SHIPPED_CFG=\"$WORK/cfg-shipped\""
+    assert cleanroom =~ "cp -R \"$SDK/config/.\" \"$SHIPPED_CFG/\""
+    assert cleanroom =~ "check_config shipped \"$SHIPPED_CFG\" AppleSpell"
+    refute cleanroom =~ "check_config shipped \"$SDK/config\" AppleSpell"
+    assert cleanroom =~ "check_config hunspell \"$HUNSPELL_CFG\" hunspell"
+    assert cleanroom =~ "run_module_probe shipped \"$SHIPPED_CFG\" AppleSpell"
+    assert cleanroom =~ "run_module_probe hunspell \"$MODULE_HUNSPELL_CFG\" hunspell"
+    assert cleanroom =~ "AppleSpell.config"
+    assert cleanroom =~ "-Wl,-rpath,\"$FW\""
+    assert cleanroom =~ "FATAL: $ENV_DIR was recreated while cleanroom held it aside"
+    assert cleanroom =~ "mv \"$ASIDE\" \"$ENV_DIR\" || {"
+    assert cleanroom =~ "FATAL: restore mv failed; backup preserved at $ASIDE"
+  end
 end

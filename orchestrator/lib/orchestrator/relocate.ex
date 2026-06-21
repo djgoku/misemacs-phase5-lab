@@ -11,6 +11,7 @@ defmodule Orchestrator.Relocate do
   (default `Orchestrator.Macho.Otool`), injectable for tests.
   """
   alias Orchestrator.Macho
+  alias Orchestrator.Relocate.Enchant
 
   @spec run(Path.t(), Path.t(), module) ::
           :ok | {:error, [Macho.violation()] | {:signature_invalid, String.t()}}
@@ -19,8 +20,17 @@ defmodule Orchestrator.Relocate do
     fw = Path.join([app, "Contents", "Frameworks"])
     File.mkdir_p!(fw)
 
+    # enchant is an orphan (nothing links it): seed its dlopen'd providers before the walk so
+    # their closure (libenchant + glib + hunspell) is pulled into Frameworks. No-op without enchant.
+    Enchant.seed_providers(app, build_libdir)
+
     copy_closure(machos(app, tool), fw, build_libdir, tool)
     Enum.each(machos(app, tool), &rewrite(&1, fw, tool))
+
+    # non-Mach-O enchant payload (link symlink + SDK headers/pc/ordering/dict): after the rewrite,
+    # before signing so it gets sealed. No-op without enchant.
+    Enchant.bundle_sdk(app, build_libdir)
+
     tool.sign_bundle(app)
 
     case tool.verify_bundle(app) do
