@@ -27,8 +27,8 @@ enchant is consumed two ways, both supported by this payload:
 - macOS `arm64` only (matches misemacs v1).
 - enchant **2.8.2** from `djgoku/enchant-feedstock@misemacs-recipe`, with **hunspell +
   applespell** providers; **applespell is the default backend**.
-- **applespell default (license-free OS spell-checker) + one bundled `en_US` hunspell dict**
-  as a working alternative (Decision C, revised 2026-06-28). The feedstock's
+- **applespell default (license-free OS spell-checker); hunspell is present but bring-your-own**
+  — no dictionaries are bundled (Decision C). The feedstock's
   `share/enchant-2/AppleSpell.config` (applespell locale map) is staged — **required**, else
   applespell claims no locale and enchant crashes on the bare-language fallback (§13).
 - Runtime libs + SDK (headers + relocatable `.pc` + a jinx `pkg-config` shim) + a tiny
@@ -40,7 +40,7 @@ enchant is consumed two ways, both supported by this payload:
 - pinentry and any "gpg stack" companion (parked; separate spec/session).
 - native-comp, more arches/OSes, Developer-ID/notarization (inherit misemacs v1 limits).
 - Pre-compiling jinx's module inside the build (we ship ingredients, not jinx itself).
-- A non-Apple default backend, or more than one bundled dictionary (`en_US` only).
+- A non-Apple default backend, or bundling any hunspell dictionaries (hunspell is bring-your-own).
 
 **Phase 0 — RESOLVED to git-source (no channel publish):** pixi builds the real feedstock
 enchant straight from the git branch via `pixi-build` (`enchant = { git = ".../enchant-feedstock",
@@ -79,14 +79,14 @@ into the app before relocate rides along with **no packaging change**.
   `.pc`, and a jinx-resolving shim so jinx compiles itself on first load. We do **not**
   adopt jinx as a build artifact (rejected "pre-build the module" — couples a third-party
   ELPA package's C module + release cadence into the Emacs build).
-- **C — Backend: applespell default + one bundled `en_US` hunspell dict (revised 2026-06-28).**
+- **C — Backend: applespell default, zero bundled dictionaries; hunspell is bring-your-own.**
   macOS-only ⇒ the OS spell-checker is always present, multilingual, license-free — applespell
   stays the default and (with the staged `AppleSpell.config`) checks + suggests `en_US`/`en_GB`
-  correctly. hunspell is a **genuinely working option**: we ship one permissively-licensed `en_US`
-  hunspell dictionary (SCOWL/LibreOffice, §13) so a user who selects hunspell gets working spell
-  check, rather than a dictionary-less stub. *Was "zero dictionaries"; revised because (a) the
-  root-cause fix for the en_US crash is `AppleSpell.config`, not a dict, and (b) the user confirmed
-  shipping one en_US hunspell dict as a working fallback.* No further dictionary long-tail.
+  correctly with **no dictionary files required**. The hunspell provider is also bundled, but no
+  dictionaries ship with it: a user who wants hunspell drops their own `en_US.aff`/`.dic` into
+  `~/.config/enchant/hunspell/` (§13). *Rationale: the root-cause fix for the en_US crash is
+  `AppleSpell.config`, not a dict; applespell covers the default path, so vendoring a ~50k-line
+  word list (license tracking, repo/diff bloat) buys little. Hunspell stays a documented BYO option.*
 - **D — Provenance: pixi/conda dependency, pinned by `pixi.lock`.** Reuse misemacs's
   existing reproducibility contract; adding the companion stays a **data change**
   (`pixi.toml` row). Rejected: standalone artifact fetch (second locking mechanism);
@@ -166,9 +166,7 @@ Emacs.app/Contents/
 │   │   ├── share/enchant-2/
 │   │   │   ├── enchant.ordering                  # *:applespell,hunspell (§13)
 │   │   │   └── AppleSpell.config                 # applespell locale map (staged from prefix; §13)
-│   │   ├── share/hunspell/
-│   │   │   ├── en_US.aff, en_US.dic              # bundled en_US dict (working hunspell option, §13)
-│   │   │   └── README_en_US.txt                  # its permissive SCOWL/LibreOffice license
+│   │   │                                          # NOTE: no share/hunspell/ — hunspell is BYO (§13)
 │   │   └── bin/
 │   │       ├── enchant-2 (+ enchant-lsmod-2)     # CLIs; on PATH via registry files: (§12)
 │   │       └── pkg-config                        # jinx shim (self-locating shell script, §10)
@@ -335,21 +333,20 @@ then it is hand-edited — two entries.)
   no longer crashes (verified cleanroom, real artifact). *Residual:* the bare-`en` upstream crash
   remains latent (only reachable if a caller explicitly requests `en` with no region) — recommend
   a feedstock patch to `applespell_checker.mm` as a follow-up; region tags (en_US/en_GB/…) are safe.
-- **Bundled `en_US` hunspell dictionary (the working hunspell option).** Ship one permissively
-  licensed `en_US` dict — the **SCOWL/LibreOffice `en_US.aff`/`.dic`** (MIT/X11-style "Atkinson
-  SCOWL" license, *Copyright 2000-2018 Kevin Atkinson*, plus a 3-clause-BSD affix and
-  public-domain word lists; no copyleft — safe to redistribute in the app bundle). Vendored in-repo
-  at `orchestrator/priv/enchant/hunspell/en_US/`, staged to `<prefix>/share/hunspell/` with its
-  `README_en_US.txt` (the required notices). The hunspell provider searches
-  `g_get_system_data_dirs()/hunspell` + `~/.config/enchant/hunspell` — **not** the enchant prefix
-  (dladdr relocation does not reach dict lookup) — so the bundled dict is discoverable by adding
-  the bundle's `share` to `XDG_DATA_DIRS` (verified working). We do **not** auto-set `XDG_DATA_DIRS`
-  (keeps O5's no-global-env-mutation; applespell-default needs no env); activation is documented.
+- **Hunspell dictionaries — bring-your-own (none bundled).** The hunspell provider ships, but no
+  dictionaries do. applespell is the default and needs no dict files, so the common path requires
+  nothing extra. A user who wants hunspell drops their own `en_US.aff`/`.dic` (e.g. from the
+  LibreOffice dictionaries repo or `app.aspell.net/create`) into `~/.config/enchant/hunspell/` —
+  the per-user dir the provider searches (`g_get_system_data_dirs()/hunspell` +
+  `~/.config/enchant/hunspell`; **not** the enchant prefix, since dladdr relocation does not reach
+  dict lookup, so no env var is needed for the per-user path). *We deliberately do not vendor a
+  word list:* applespell covers the default, and a ~50k-line `.dic` adds license-tracking and
+  repo/diff bloat for the secondary path. Activation (files + an `enchant.ordering` preferring
+  hunspell) is documented in the README.
 
 > **O6 — RESOLVED (2026-06-28):** applespell checking *and* suggestions work for `en_US`/`en_GB`
-> once `AppleSpell.config` is staged (e.g. `helllo → hello, he'll`). A bundled `en_US` hunspell
-> dict is shipped anyway as the user-confirmed working alternative (above), discoverable via
-> `XDG_DATA_DIRS`.
+> once `AppleSpell.config` is staged (e.g. `helllo → hello, he'll`). No hunspell dictionary is
+> bundled — hunspell is a documented bring-your-own option (above).
 
 ## 14. Testing / validation (Definition of Done)
 
@@ -392,7 +389,7 @@ Extend the existing gates rather than inventing a parallel harness:
 | O3 | ✅ spike-resolved: DYLD self-heal dead; staleness fixed by in-place rpath-patch | §11 |
 | O4 | ⚙ folded: advice guarded by `fboundp`; still confirm name/arity vs. pin | §11 |
 | O5 | `site-start.el` opt-out? (no longer mutates global env) | §11 |
-| O6 | ✅ resolved (2026-06-28): applespell checks+suggests `en_US` once `AppleSpell.config` staged; ship one `en_US` hunspell dict as the working option | §13 |
+| O6 | ✅ resolved (2026-06-28): applespell checks+suggests `en_US` once `AppleSpell.config` staged; hunspell is bring-your-own (no bundled dict) | §13 |
 | O7 | ✅ resolved: Phase 0 = **git-source via pixi-build** (no channel publish/credentials) | §2, §6 |
 | O8 | ✅ spike-resolved: ordering at `share/enchant-2/` (or `etc/enchant-2/`), not `share/enchant/` | §13 |
 | O9 | ✅ resolved (2026-06-28, real build + cleanroom): `enchant-lsmod-2` + `enchant-2 -d en_US` resolve providers through an absolute symlink to the app — `dladdr` handles symlinked launch | §14 |

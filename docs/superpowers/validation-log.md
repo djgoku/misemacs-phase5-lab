@@ -508,15 +508,15 @@ anaconda/prefix.dev account. Both `versions/{master,emacs-31}/pixi.lock` re-lock
   (`& helllo 2 0: hello, he'll`); en_GB also works; `enchant-2 -l -d en_US` exits 0 (no crash).
   *Residual:* the bare-`en` upstream crash stays latent (only if a caller requests `en` with no
   region) — recommend a feedstock patch to `applespell_checker.mm` as a follow-up; region tags safe.
-- **Decision C revised → applespell default + one bundled `en_US` hunspell dict.** Vendored the
-  permissive **SCOWL/LibreOffice `en_US.aff`/`.dic` + `README_en_US.txt`** (MIT/X11-style "Atkinson
-  SCOWL" license, *Copyright 2000-2018 Kevin Atkinson*; 3-clause-BSD affix + public-domain lists; no
-  copyleft — safe to redistribute in the bundle) at `orchestrator/priv/enchant/hunspell/en_US/`,
-  staged to `<prefix>/share/hunspell/`. The hunspell provider searches `g_get_system_data_dirs()/hunspell`
-  + `~/.config/enchant/hunspell` — **not** the enchant prefix (dladdr does not reach dict lookup) — so
-  the bundled dict is discoverable via `XDG_DATA_DIRS=<prefix>/share` (verified: both `helllo`/`teh`
-  flagged, real suggestions). We do **not** auto-set `XDG_DATA_DIRS` (keeps O5's no-global-env-mutation;
-  applespell-default needs no env); hunspell activation is documented.
+- **Decision C → applespell default, zero bundled dictionaries; hunspell is bring-your-own.** The
+  AppleSpell.config fix (above) makes applespell check + suggest `en_US`/`en_GB` with no dict files,
+  so the default path needs nothing extra. We evaluated bundling a permissive **SCOWL/LibreOffice
+  `en_US` hunspell dict** but **decided against it** — applespell covers the default and a ~50k-line
+  `.dic` adds license-tracking + repo/diff bloat for the secondary path. The hunspell provider still
+  ships; a user enables it by dropping their own `en_US.aff`/`.dic` into `~/.config/enchant/hunspell/`
+  (the per-user dir the provider searches: `g_get_system_data_dirs()/hunspell` +
+  `~/.config/enchant/hunspell` — **not** the enchant prefix, since dladdr does not reach dict lookup).
+  No global env mutation (O5); BYO activation is documented in the README.
 
 ### 3. Finding — build-prefix `leak_check` DROPPED
 `verify/3`'s `strings`-grep for the conda prefix false-flagged 6 legitimately-relocated dylibs
@@ -534,7 +534,7 @@ commands) + per-file `codesign --verify --strict` + the functional cleanroom run
 - **O5 — `site-start.el` keeps auto-load** but is discovery-only: no `DYLD_*`, no policy
   (`ispell-program-name` untouched); its only effect is `with-eval-after-load 'jinx` advice. Opt out
   with `(setq misemacs-enchant-disable t)` or `emacs -Q` / `--no-site-file`.
-- **O6 — resolved** (applespell checks+suggests en_US/en_GB once `AppleSpell.config` staged); ship the
-  en_US hunspell dict as the working option anyway.
+- **O6 — resolved** (applespell checks+suggests en_US/en_GB once `AppleSpell.config` staged); hunspell
+  is bring-your-own (no bundled dict).
 - **O8 — confirmed:** the built env's `share/enchant-2/enchant.ordering` is the ordering path (our
   staged `*:applespell,hunspell` overrides the feedstock default `*:hunspell,nuspell,aspell`).
