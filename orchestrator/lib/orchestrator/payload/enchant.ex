@@ -152,11 +152,21 @@ defmodule Orchestrator.Payload.Enchant do
     #    feedstock at share/enchant-2/. REQUIRED for applespell (the default backend): without it
     #    applespell claims no locale, `enchant_broker_dict_exists("en_US")` returns 0, and enchant
     #    falls back to the bare-language tag, which hits a flaky upstream applespell NULL-deref
-    #    crash (verified 2026-06-28). Copy it verbatim from the prefix when present.
+    #    crash (verified 2026-06-28). HARD requirement whenever the applespell provider is staged:
+    #    a missing config would silently resurrect that crash, so fail loudly instead.
     apple_config = src.("share/enchant-2/AppleSpell.config")
+    applespell_staged? = File.exists?(Path.join(lib, "enchant-2/enchant_applespell.so"))
 
-    if File.exists?(apple_config) do
-      cp!(apple_config, Path.join(ench, "share/enchant-2/AppleSpell.config"))
+    cond do
+      File.exists?(apple_config) ->
+        cp!(apple_config, Path.join(ench, "share/enchant-2/AppleSpell.config"))
+
+      applespell_staged? ->
+        raise "enchant payload: applespell provider staged but #{apple_config} is missing — " <>
+                "applespell would claim no locale and crash on the bare-language fallback"
+
+      true ->
+        :ok
     end
 
     # 5. Bundled en_US hunspell dictionary — the "working hunspell option" (applespell is the
@@ -165,8 +175,18 @@ defmodule Orchestrator.Payload.Enchant do
     #    data location <prefix>/share/hunspell so the hunspell provider finds it when the bundle's
     #    share is on XDG_DATA_DIRS (the provider searches g_get_system_data_dirs()/hunspell +
     #    ~/.config/enchant/hunspell — NOT the enchant prefix, so dladdr relocation doesn't reach it).
+    #    Assert the required files resolve in priv first, so a mispackaged release (empty priv,
+    #    wrong OTP app dir) fails loudly rather than shipping a dictless hunspell.
     hunspell_dst = Path.join(ench, "share/hunspell")
     File.mkdir_p!(hunspell_dst)
+
+    for required <- ["en_US.aff", "en_US.dic"] do
+      path = Path.join(hunspell_dict_dir(), required)
+
+      unless File.exists?(path) do
+        raise "enchant payload: vendored hunspell dict missing #{required} at #{path}"
+      end
+    end
 
     for f <- Path.wildcard(Path.join(hunspell_dict_dir(), "*")) do
       cp!(f, Path.join(hunspell_dst, Path.basename(f)))
