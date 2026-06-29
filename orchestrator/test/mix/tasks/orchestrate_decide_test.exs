@@ -63,7 +63,7 @@ defmodule Mix.Tasks.Orchestrate.DecideTest do
 
     deps = %{
       upstream: fn _ref -> "sha-x" end,
-      releases: fn _repo -> nil end,
+      releases: fn _repo -> :empty end,
       toolchain: fn -> "sha256:cltfix" end
     }
 
@@ -76,5 +76,40 @@ defmodule Mix.Tasks.Orchestrate.DecideTest do
     assert out.any == true
     assert out.dry_run == false
     assert Enum.any?(out.matrix["include"], &(&1.name == "master"))
+  end
+
+  test "detect: :error from a channel repo aborts the run" do
+    deps = %{
+      upstream: fn _v -> "sha" end,
+      toolchain: fn -> "test-clt" end,
+      releases: fn
+        "djgoku/misemacs-emacs-31" -> {:error, :unauthorized}
+        "djgoku/misemacs-emacs-master" -> :empty
+        other -> flunk("unexpected repo #{other}")
+      end
+    }
+
+    assert_raise Mix.Error, ~r/unauthorized/, fn ->
+      Mix.Tasks.Orchestrate.Decide.exec(
+        %{repo: "djgoku/misemacs", date: "2026-06-29", mode: "detect", root: ".."},
+        deps
+      )
+    end
+  end
+
+  test "detect: all channels :empty => every version is first-run (builds)" do
+    deps = %{
+      upstream: fn _v -> "newsha" end,
+      toolchain: fn -> "test-clt" end,
+      releases: fn _repo -> :empty end
+    }
+
+    out =
+      Mix.Tasks.Orchestrate.Decide.exec(
+        %{repo: "djgoku/misemacs", date: "2026-06-29", mode: "detect", root: ".."},
+        deps
+      )
+
+    assert out.any == true
   end
 end
