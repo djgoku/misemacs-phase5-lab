@@ -95,6 +95,32 @@ and assert `(fboundp 'jinx--load-module)` with a clear O4 message before using i
 launch) are **pass/fail Task-6 gates**, not "record if settled". O7: the feedstock channel URL must be filled
 before the re-lock. S1 is regression-covered by the R9 `verify_file` assertions.
 
+## Backend + Phase-0 + leak_check revisions (2026-06-28, real-artifact debug) — AUTHORITATIVE
+
+A focused debug spike (git-source-built **real** feedstock enchant staged + lldb'd in the cleanroom)
+supersedes three earlier assumptions. Apply throughout:
+
+- **R13 — Phase 0 = git-source via pixi-build (no channel publish).** Everywhere the plan/spec says
+  "publish the feedstock to a conda channel" / `<feedstock-channel>`, use instead, in **both**
+  `versions/<v>/pixi.toml`: `[workspace] preview = ["pixi-build"]` and
+  `enchant = { git = "https://github.com/djgoku/enchant-feedstock", branch = "misemacs-recipe", subdirectory = "recipe" }`.
+  `pixi.lock` pins the git commit (the reproducibility pin). R10's "assert URL is the feedstock channel"
+  becomes "assert the locked enchant source is the feedstock git repo + commit". No prefix.dev/anaconda account.
+- **R14 — `stage_copy` must also stage `share/enchant-2/AppleSpell.config` + a bundled `en_US` hunspell dict.**
+  Root cause of the en_US SEGFAULT + `dict_exists("en_US")=0` (handoff Finding 2) is that `stage_copy` dropped
+  the feedstock's `AppleSpell.config` (applespell's locale map) — NOT a dict-less hunspell crash. Fix: copy
+  `AppleSpell.config` from the prefix (guarded by `File.exists?`), and stage the vendored permissive
+  `en_US.aff`/`.dic`/`README` (in `orchestrator/priv/enchant/hunspell/en_US/`) to `<prefix>/share/hunspell/`.
+  Decision C is revised to "applespell default + one bundled `en_US` hunspell dict" (spec §13). The e2e asserts
+  both are staged. **DONE on branch (verified: 116 passing).** Residual upstream applespell bare-`en` crash →
+  feedstock-patch follow-up (region tags are safe).
+- **R15 — drop the build-prefix `leak_check`.** Real conda dylibs bake the install prefix into inert
+  data-section strings → `verify/3`'s `strings`-grep false-flagged 6 relocated libs. Removed from `verify/3`
+  (`conda_prefix` arg kept for signature stability, unused) and the leak failure test removed. **This also
+  voids the Task-6 cleanroom `strings | grep '/(envs|\.pixi)/'` step (R15) — do not add it.** The macho gate +
+  per-file `codesign --verify --strict` + the functional cleanroom run are the real self-containment proof.
+  Supersedes spec §14's leak bullet, the R9 leak mention, and Codex-D's `strings|grep` recommendation.
+
 ## File Structure
 
 | Path | New? | Responsibility |
