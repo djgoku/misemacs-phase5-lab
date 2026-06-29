@@ -77,13 +77,6 @@ defmodule Orchestrator.Releases.Gh do
     end
   end
 
-  defp trim_nil(s) do
-    case String.trim(s) do
-      "" -> nil
-      t -> t
-    end
-  end
-
   defp gh(args) do
     System.cmd("gh", args, stderr_to_stdout: true)
   rescue
