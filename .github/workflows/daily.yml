@@ -15,7 +15,9 @@ permissions:
   contents: read
 
 env:
-  MISEMACS_ARTIFACT_BASE: djgoku/misemacs
+  # Repo-relative so the lab (djgoku/misemacs-phase5-lab) targets its OWN artifact repos
+  # (…-phase5-lab-emacs-<channel>) and prod (djgoku/misemacs) targets misemacs-emacs-<channel>.
+  MISEMACS_ARTIFACT_BASE: ${{ github.repository }}
 
 # No workflow-level concurrency: serialization is per-job (build-<name>-<target> +
 # finalize-latest), so distinct cells run in parallel and only same-cell / latest collide.
@@ -103,8 +105,8 @@ jobs:
         with:
           app-id: ${{ secrets.MISEMACS_APP_ID }}
           private-key: ${{ secrets.MISEMACS_APP_PRIVATE_KEY }}
-          owner: djgoku
-          repositories: ${{ format('misemacs-emacs-{0}', matrix.channel) }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ format('{0}-emacs-{1}', github.event.repository.name, matrix.channel) }}
       - name: publish (real) or package+artifact (dry-run)
         env:
           GH_TOKEN: ${{ steps.pubtoken.outputs.token || github.token }}
@@ -168,8 +170,8 @@ jobs:
         with:
           app-id: ${{ secrets.MISEMACS_APP_ID }}
           private-key: ${{ secrets.MISEMACS_APP_PRIVATE_KEY }}
-          owner: djgoku
-          repositories: ${{ format('misemacs-emacs-{0}', matrix.channel) }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ format('{0}-emacs-{1}', github.event.repository.name, matrix.channel) }}
       - name: finalize + promote this channel
         env:
           GH_TOKEN: ${{ steps.fintoken.outputs.token }}
