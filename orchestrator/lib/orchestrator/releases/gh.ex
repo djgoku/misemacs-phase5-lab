@@ -19,14 +19,21 @@ defmodule Orchestrator.Releases.Gh do
     classify(list_tags(repo), &fetch(repo, &1))
   end
 
+  # Bound the newest-first scan: a healthy repo's newest tag carries the manifest (1 fetch);
+  # this only scans further past manifest-LESS in-flight releases (published this run, manifest
+  # attached later by finalize) — never the whole list.
+  @scan_back 10
+
   @doc """
-  Pure decision over a `list_tags` result + a `fetch.(tag)` fun. ONLY the lexical-newest
-  tag is authoritative (matches aqua's `github_tag` resolution; the per-channel repo holds
-  one channel so the max is unambiguous):
-    * `{:error, reason}`              -> `{:error, reason}` (repo unreachable/auth failure)
-    * `{:ok, []}`                     -> `:empty` (reachable, no releases = first run)
-    * `{:ok, tags}`, newest has mfst  -> `{:ok, manifest}`
-    * `{:ok, tags}`, newest lacks it  -> `{:error, {:no_manifest_on_newest, tag}}`
+  Pure decision over a `list_tags` result + a `fetch.(tag)` fun. Scans the newest tags first
+  (lexical-desc) and returns the FIRST one that carries a `build-manifest.json` — tolerating
+  manifest-less releases (a release is published BEFORE finalize attaches its manifest, so the
+  lexical-newest tag during/after a run may legitimately have none yet):
+    * `{:error, reason}`        -> `{:error, reason}` (the LIST fetch failed = repo unreachable/auth)
+    * `{:ok, []}`               -> `:empty` (reachable, no releases = first run)
+    * `{:ok, tags}`, a recent tag has a manifest -> `{:ok, manifest}`
+    * `{:ok, tags}`, none of the newest #{@scan_back} has one -> `:empty` (treat as no-prior /
+      first-run; callers rebuild, which self-heals — no hard deadlock on a manifest-less release)
   """
   @spec classify({:ok, [String.t()]} | {:error, term()}, (String.t() -> map() | nil)) ::
           {:ok, map()} | :empty | {:error, term()}
@@ -34,10 +41,12 @@ defmodule Orchestrator.Releases.Gh do
   def classify({:ok, []}, _fetch), do: :empty
 
   def classify({:ok, tags}, fetch) do
-    newest = Enum.max(tags)
-
-    case fetch.(newest) do
-      nil -> {:error, {:no_manifest_on_newest, newest}}
+    tags
+    |> Enum.sort(:desc)
+    |> Enum.take(@scan_back)
+    |> Enum.find_value(fn tag -> fetch.(tag) end)
+    |> case do
+      nil -> :empty
       manifest -> {:ok, manifest}
     end
   end
