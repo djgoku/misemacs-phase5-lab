@@ -141,9 +141,9 @@ A "build" is a *version*: one row in =versions.toml= plus a =versions/<name>/= d
 1. Add a row to [[versions.toml][=versions.toml=]] (=ref = "emacs-31"=, =channel = "31"= → tag =emacs-31-YYYY-MM-DD=).
 2. Add a [[versions/emacs-31/][=versions/emacs-31/=]] directory copied from =master/= with =EMACS_REF= flipped to =emacs-31=. The =pixi.lock= is reused verbatim since build dependencies don't depend on the Emacs version.
 3. Add a package entry to [[aqua/registry.yaml][=aqua/registry.yaml=]] pointing at =repo_name: misemacs-emacs-<channel>= (copy an existing entry and adjust =name=, =repo_name=, =description=, and =version_prefix=).
-4. Create the artifact repo (one-time):
+4. Create the artifact repo (one-time). It MUST have an initial commit — GitHub returns =HTTP 422 "Repository is empty"= when you try to create the first release/tag on a repo with no default branch, so pass =--add-readme=:
    #+begin_src sh
-   gh repo create djgoku/misemacs-emacs-<channel> --public
+   gh repo create djgoku/misemacs-emacs-<channel> --public --add-readme
    #+end_src
 5. Install the publishing GitHub App on the new artifact repo so the daily workflow can push releases to it.
 
